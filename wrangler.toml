@@ -1,6 +1,7 @@
 name = "ical-proxy"
 main = "worker.js"
 compatibility_date = "2024-01-01"
+account_id = "1514ae545ad6f0b625c764062b269275"
 
 [triggers]
 crons = ["*/5 * * * *"]
