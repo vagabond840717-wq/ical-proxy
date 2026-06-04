@@ -1,0 +1,14 @@
+name = "ical-proxy"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[kv_namespaces]]
+binding = "HANA_KV"
+id = "e89b7b8beed147a79c2a72d58a12b676"
+
+[[kv_namespaces]]
+binding = "PUSH_KV"
+id = "f5ffc03c9597433986632475d6215cf10"
