@@ -6,7 +6,7 @@ crons = ["*/5 * * * *"]
 
 [[kv_namespaces]]
 binding = "HANA_KV"
-id = "e89b7b8beed147a79c2a72d58a12b676"
+id = "e89b1b8beed147a79c2a72d58a12b676"
 
 [[kv_namespaces]]
 binding = "PUSH_KV"
