@@ -326,13 +326,7 @@ function parseIcal(text, platform) {
     const summary = (block.match(/SUMMARY:(.+)/)                || [])[1]?.trim() || '';
     if (!dtstart || !dtend) continue;
     const pd = d => ({ y: +d.slice(0,4), m: +d.slice(4,6)-1, d: +d.slice(6,8) });
-    let cin = pd(dtstart), cout = pd(dtend);
-    // Airbnb "Not Available" DTEND는 exclusive (첫 빈 날) → 1일 빼서 실제 마지막 블락일로 저장
-    if (platform === 'airbnb' && summary.toLowerCase().includes('not available')) {
-      const coutDate = new Date(cout.y, cout.m, cout.d);
-      coutDate.setDate(coutDate.getDate() - 1);
-      cout = { y: coutDate.getFullYear(), m: coutDate.getMonth(), d: coutDate.getDate() };
-    }
+    const cin = pd(dtstart), cout = pd(dtend);
     if (platform !== 'booking' && platform !== 'airbnb' && summary.toLowerCase().includes('not available')) continue;
     if (platform === 'airbnb' && summary === 'Reserved') {
       const desc = (block.match(/DESCRIPTION:(.+)/) || [])[1] || '';
@@ -355,13 +349,8 @@ async function exportIcal(env, roomName) {
   let events = '', uid = 1;
   for (const [key, bks] of Object.entries(roomBookings)) {
     for (const bk of bks) {
-      // Airbnb "Not Available" 항목은 내보내기에서 제외 (순환 블락 방지)
-      if (bk.summary?.toLowerCase().includes('not available')) continue;
       const ds = `${bk.cinY}${String(bk.cinM+1).padStart(2,'0')}${String(bk.cinD).padStart(2,'0')}`;
-      // Trip.com·Booking.com의 체크아웃 당일은 예약가능일 → DTEND를 하루 앞당겨 내보냄
-      let deDate = new Date(bk.coutY, bk.coutM, bk.coutD);
-      if (key === 'tr' || key === 'bk') deDate.setDate(deDate.getDate() - 1);
-      const de = `${deDate.getFullYear()}${String(deDate.getMonth()+1).padStart(2,'0')}${String(deDate.getDate()).padStart(2,'0')}`;
+      const de = `${bk.coutY}${String(bk.coutM+1).padStart(2,'0')}${String(bk.coutD).padStart(2,'0')}`;
       events += `BEGIN:VEVENT\r\nUID:hana-${roomName}-${key}-${uid++}@vagabond1984.workers.dev\r\nDTSTART;VALUE=DATE:${ds}\r\nDTEND;VALUE=DATE:${de}\r\nSUMMARY:${lbl[key]||key} 예약 (${roomName})\r\nEND:VEVENT\r\n`;
     }
   }
