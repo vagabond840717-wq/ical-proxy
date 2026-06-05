@@ -326,7 +326,13 @@ function parseIcal(text, platform) {
     const summary = (block.match(/SUMMARY:(.+)/)                || [])[1]?.trim() || '';
     if (!dtstart || !dtend) continue;
     const pd = d => ({ y: +d.slice(0,4), m: +d.slice(4,6)-1, d: +d.slice(6,8) });
-    const cin = pd(dtstart), cout = pd(dtend);
+    let cin = pd(dtstart), cout = pd(dtend);
+    // 에어비앤비 "Not Available"은 DTEND가 체크아웃 다음날로 옴 → 하루 빼서 실제 체크아웃일로 저장
+    if (platform === 'airbnb' && summary.toLowerCase().includes('not available')) {
+      const coutDate = new Date(cout.y, cout.m, cout.d);
+      coutDate.setDate(coutDate.getDate() - 1);
+      cout = { y: coutDate.getFullYear(), m: coutDate.getMonth(), d: coutDate.getDate() };
+    }
     if (platform !== 'booking' && platform !== 'airbnb' && summary.toLowerCase().includes('not available')) continue;
     if (platform === 'airbnb' && summary === 'Reserved') {
       const desc = (block.match(/DESCRIPTION:(.+)/) || [])[1] || '';
