@@ -267,6 +267,8 @@ async function syncAllRooms(env, withPush = false) {
         for (const uid of cancelled) {
           const b = prevMap[uid] || {};
           if (b.cinY !== undefined && new Date(b.cinY, b.cinM, b.cinD) > sixMonthsLater) continue;
+          // 체크아웃이 1달 이상 지난 예약은 정상 만료 — 취소 오감지 방지
+          if (b.coutY !== undefined) { const _oma = new Date(); _oma.setMonth(_oma.getMonth() - 1); if (new Date(b.coutY, b.coutM, b.coutD) < _oma) continue; }
           const dateStr = b.cin ? `${b.cin}~${b.cout}` : '';
           const msg = { title: `❌ ${room.name} 예약 취소`, body: `${p.label}${dateStr ? ' ' + dateStr : ''} 취소됐어요.`, room: room.name };
           await sendPushToAll(env, msg);
@@ -338,9 +340,9 @@ function parseIcal(text, platform) {
       const desc = (block.match(/DESCRIPTION:(.+)/) || [])[1] || '';
       if (!desc.includes('airbnb.com/hosting/reservations')) continue;
     }
-    const today = new Date(); today.setHours(0,0,0,0);
+    const oneMonthAgo = new Date(); oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1); oneMonthAgo.setHours(0,0,0,0);
     const coutDate = new Date(cout.y, cout.m, cout.d);
-    if (coutDate < today) continue;
+    if (coutDate < oneMonthAgo) continue;
     bookings.push({ cinY: cin.y, cinM: cin.m, cinD: cin.d, coutY: cout.y, coutM: cout.m, coutD: cout.d, platform, summary });
   }
   return bookings;
