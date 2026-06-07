@@ -41,6 +41,10 @@ export default {
       const data = await env.HANA_KV.get('synced_bookings');
       return new Response(data || '{}', { headers: { 'Content-Type': 'application/json', ...cors(request) } });
     }
+    if (path === '/archive' && request.method === 'GET') {
+      const data = await env.HANA_KV.get('booking_archive');
+      return new Response(data || '{}', { headers: { 'Content-Type': 'application/json', ...cors(request) } });
+    }
     if (path === '/push/subscribe' && request.method === 'POST') {
       const sub = await request.json();
       const key = 'sub_' + btoa(sub.endpoint).slice(0, 40).replace(/[+/=]/g, '');
@@ -203,6 +207,8 @@ async function syncAllRooms(env, withPush = false) {
   const rooms = JSON.parse(roomsRaw);
   const synced_bookings = {};
   const prevSynced = JSON.parse(await env.HANA_KV.get('synced_bookings') || '{}');
+  const prevArchive = JSON.parse(await env.HANA_KV.get('booking_archive') || '{}');
+  const newArchive = {};
   const prev = withPush ? JSON.parse(await env.PUSH_KV.get('last_booking_uids') || '{}') : {};
   const curr = {};
   await Promise.all(rooms.map(async (room) => {
@@ -213,6 +219,7 @@ async function syncAllRooms(env, withPush = false) {
       tr: prevRoomData.tr || [],
       lv: prevRoomData.lv || [],
     };
+    newArchive[room.name] = { ab: [], bk: [], tr: [], lv: [] };
     const platforms = [
       { key: 'ab', url: room.url,   label: 'Airbnb',      type: 'airbnb'  },
       { key: 'bk', url: room.bkUrl, label: 'Booking.com', type: 'booking' },
@@ -240,6 +247,7 @@ async function syncAllRooms(env, withPush = false) {
         await env.PUSH_KV.delete(failKey);
       }
       bookings[p.key] = result;
+      newArchive[room.name][p.key] = result;
       if (withPush) {
         const bookingMap = {};
         result.filter(b => !b.summary?.toLowerCase().includes('not available')).forEach(b => {
@@ -268,7 +276,33 @@ async function syncAllRooms(env, withPush = false) {
     }
     synced_bookings[room.name] = bookings;
   }));
+  // 아카이브 병합: synced_bookings와 완전 분리된 별도 저장
+  const cutoff = new Date();
+  cutoff.setMonth(cutoff.getMonth() - 13);
+  cutoff.setHours(0, 0, 0, 0);
+  const mergedArchive = {};
+  for (const room of rooms) {
+    const prevRoom = prevArchive[room.name] || {};
+    const freshRoom = newArchive[room.name] || {};
+    mergedArchive[room.name] = {};
+    for (const key of ['ab', 'bk', 'tr', 'lv']) {
+      const existing = prevRoom[key] || [];
+      const incoming = (freshRoom[key] || []).filter(b => {
+        const s = (b.summary || '').toLowerCase();
+        return !s.includes('not available') && s !== 'closed' && s !== '';
+      });
+      const existingUids = new Set(existing.map(b => `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`));
+      const merged = [...existing];
+      for (const b of incoming) {
+        const uid = `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`;
+        if (!existingUids.has(uid)) merged.push(b);
+      }
+      mergedArchive[room.name][key] = merged.filter(b => new Date(b.coutY, b.coutM, b.coutD) >= cutoff);
+    }
+  }
+
   await env.HANA_KV.put('synced_bookings', JSON.stringify(synced_bookings));
+  await env.HANA_KV.put('booking_archive', JSON.stringify(mergedArchive));
   await env.HANA_KV.put('last_sync', new Date().toISOString());
   if (withPush) await env.PUSH_KV.put('last_booking_uids', JSON.stringify(curr));
   return { synced: rooms.length, time: new Date().toISOString() };
