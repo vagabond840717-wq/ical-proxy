@@ -243,7 +243,7 @@ async function syncAllRooms(env, withPush = false) {
       if (withPush) {
         const bookingMap = {};
         result.filter(b => !b.summary?.toLowerCase().includes('not available')).forEach(b => {
-          const uid = b.summary + b.cinY + b.cinM + b.cinD;
+          const uid = `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`;
           const cin  = `${b.cinY}/${String(b.cinM+1).padStart(2,'0')}/${String(b.cinD).padStart(2,'0')}`;
           const cout = `${b.coutY}/${String(b.coutM+1).padStart(2,'0')}/${String(b.coutD).padStart(2,'0')}`;
           bookingMap[uid] = { ...b, cin, cout };
@@ -263,16 +263,6 @@ async function syncAllRooms(env, withPush = false) {
           const msg = { title: `📅 ${room.name} 새 예약`, body: `${p.label} ${b.cin}~${b.cout}`, room: room.name };
           await sendPushToAll(env, msg);
           await saveEvent(env, { type: 'new', room: room.name, platform: p.label, cin: b.cin, cout: b.cout, ts: Date.now() });
-        }
-        for (const uid of cancelled) {
-          const b = prevMap[uid] || {};
-          if (b.cinY !== undefined && new Date(b.cinY, b.cinM, b.cinD) > sixMonthsLater) continue;
-          // 체크아웃이 1달 이상 지난 예약은 정상 만료 — 취소 오감지 방지
-          if (b.coutY !== undefined) { const _oma = new Date(); _oma.setMonth(_oma.getMonth() - 1); if (new Date(b.coutY, b.coutM, b.coutD) < _oma) continue; }
-          const dateStr = b.cin ? `${b.cin}~${b.cout}` : '';
-          const msg = { title: `❌ ${room.name} 예약 취소`, body: `${p.label}${dateStr ? ' ' + dateStr : ''} 취소됐어요.`, room: room.name };
-          await sendPushToAll(env, msg);
-          await saveEvent(env, { type: 'cancel', room: room.name, platform: p.label, cin: b.cin || '', cout: b.cout || '', ts: Date.now() });
         }
       }
     }
