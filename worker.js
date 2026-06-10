@@ -211,6 +211,9 @@ async function syncAllRooms(env, withPush = false) {
   const newArchive = {};
   const prev = withPush ? JSON.parse(await env.PUSH_KV.get('last_booking_uids') || '{}') : {};
   const curr = {};
+  // 복구 감지용: 루프 시작 전 현재 미확인 오류 이벤트 목록을 1회 로드
+  const cachedEvents = withPush ? JSON.parse(await env.PUSH_KV.get('events') || '[]') : [];
+  const recoveryActions = []; // { room, platform } — 루프 후 일괄 처리
   await Promise.all(rooms.map(async (room) => {
     const prevRoomData = prevSynced[room.name] || {};
     const bookings = {
@@ -244,6 +247,9 @@ async function syncAllRooms(env, withPush = false) {
       }
       if (withPush) {
         const failKey = `fail_${room.name}_${p.key}`;
+        // 복구 감지: 이번 성공 전에 미확인 오류 알림이 있었으면 복구 처리 예약
+        const hadError = cachedEvents.some(e => e.type === 'error' && !e.read && e.room === room.name && e.platform === p.label);
+        if (hadError) recoveryActions.push({ room: room.name, platform: p.label });
         await env.PUSH_KV.delete(failKey);
       }
       bookings[p.key] = result;
@@ -305,6 +311,23 @@ async function syncAllRooms(env, withPush = false) {
   await env.HANA_KV.put('booking_archive', JSON.stringify(mergedArchive));
   await env.HANA_KV.put('last_sync', new Date().toISOString());
   if (withPush) await env.PUSH_KV.put('last_booking_uids', JSON.stringify(curr));
+
+  // 복구 처리 일괄 적용: 루프 완료 후 최신 events KV를 다시 읽어 안전하게 수정
+  if (withPush && recoveryActions.length > 0) {
+    const evRaw = await env.PUSH_KV.get('events');
+    const evts = evRaw ? JSON.parse(evRaw) : [];
+    for (const { room, platform } of recoveryActions) {
+      evts.forEach(e => {
+        if (e.type === 'error' && !e.read && e.room === room && e.platform === platform) e.read = true;
+      });
+      const recId = Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+      evts.unshift({ id: recId, type: 'recovered', room, platform, cin: '', cout: '', ts: Date.now(), read: false });
+      await sendPushToAll(env, { title: `✅ ${room} 다시 연결됨`, body: `${platform} iCal 연결이 복구됐어요`, room });
+    }
+    if (evts.length > 50) evts.splice(50);
+    await env.PUSH_KV.put('events', JSON.stringify(evts));
+  }
+
   return { synced: rooms.length, time: new Date().toISOString() };
 }
 
