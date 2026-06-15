@@ -206,10 +206,13 @@ async function syncAllRooms(env, withPush = false) {
   if (!roomsRaw) return { synced: 0, time: new Date().toISOString() };
   const rooms = JSON.parse(roomsRaw);
   const synced_bookings = {};
-  const prevSynced = JSON.parse(await env.HANA_KV.get('synced_bookings') || '{}');
-  const prevArchive = JSON.parse(await env.HANA_KV.get('booking_archive') || '{}');
+  const prevSyncedRaw = await env.HANA_KV.get('synced_bookings') || '{}';
+  const prevSynced = JSON.parse(prevSyncedRaw);
+  const prevArchiveRaw = await env.HANA_KV.get('booking_archive') || '{}';
+  const prevArchive = JSON.parse(prevArchiveRaw);
   const newArchive = {};
-  const prev = withPush ? JSON.parse(await env.PUSH_KV.get('last_booking_uids') || '{}') : {};
+  const prevUidsRaw = withPush ? (await env.PUSH_KV.get('last_booking_uids') || '{}') : '{}';
+  const prev = withPush ? JSON.parse(prevUidsRaw) : {};
   const curr = {};
   // 복구 감지용: 루프 시작 전 현재 미확인 오류 이벤트 목록을 1회 로드
   const cachedEvents = withPush ? JSON.parse(await env.PUSH_KV.get('events') || '[]') : [];
@@ -312,10 +315,14 @@ async function syncAllRooms(env, withPush = false) {
     }
   }
 
-  await env.HANA_KV.put('synced_bookings', JSON.stringify(synced_bookings));
-  await env.HANA_KV.put('booking_archive', JSON.stringify(mergedArchive));
-  await env.HANA_KV.put('last_sync', new Date().toISOString());
-  if (withPush) await env.PUSH_KV.put('last_booking_uids', JSON.stringify(curr));
+  const newSyncedRaw = JSON.stringify(synced_bookings);
+  if (newSyncedRaw !== prevSyncedRaw) await env.HANA_KV.put('synced_bookings', newSyncedRaw);
+  const newArchiveRaw = JSON.stringify(mergedArchive);
+  if (newArchiveRaw !== prevArchiveRaw) await env.HANA_KV.put('booking_archive', newArchiveRaw);
+  if (withPush) {
+    const newUidsRaw = JSON.stringify(curr);
+    if (newUidsRaw !== prevUidsRaw) await env.PUSH_KV.put('last_booking_uids', newUidsRaw);
+  }
 
   // 복구 처리 일괄 적용: 루프 완료 후 최신 events KV를 다시 읽어 안전하게 수정
   if (withPush && recoveryActions.length > 0) {
