@@ -238,6 +238,7 @@ async function syncAllRooms(env, withPush = false) {
       const result = await fetchAndParseIcal(p.url, p.type);
       if (result === null) {
         if (withPush) {
+          curr[room.name + '_' + p.key] = prev[room.name + '_' + p.key] || {};
           const failKey = `fail_${room.name}_${p.key}`;
           const failCount = parseInt(await env.PUSH_KV.get(failKey) || '0') + 1;
           await env.PUSH_KV.put(failKey, String(failCount));
