@@ -213,6 +213,10 @@ async function syncAllRooms(env, withPush = false) {
   const curr = {};
   // 복구 감지용: 루프 시작 전 현재 미확인 오류 이벤트 목록을 1회 로드
   const cachedEvents = withPush ? JSON.parse(await env.PUSH_KV.get('events') || '[]') : [];
+  // fail_ 키가 실제로 존재하는 것만 미리 파악 → 성공 시 불필요한 delete 방지 (KV write 한도 절약)
+  const hotFailKeys = withPush
+    ? new Set((await env.PUSH_KV.list({ prefix: 'fail_' })).keys.map(k => k.name))
+    : new Set();
   const recoveryActions = []; // { room, platform } — 루프 후 일괄 처리
   await Promise.all(rooms.map(async (room) => {
     const prevRoomData = prevSynced[room.name] || {};
@@ -250,7 +254,7 @@ async function syncAllRooms(env, withPush = false) {
         // 복구 감지: 이번 성공 전에 미확인 오류 알림이 있었으면 복구 처리 예약
         const hadError = cachedEvents.some(e => e.type === 'error' && !e.read && e.room === room.name && e.platform === p.label);
         if (hadError) recoveryActions.push({ room: room.name, platform: p.label });
-        await env.PUSH_KV.delete(failKey);
+        if (hotFailKeys.has(failKey)) await env.PUSH_KV.delete(failKey);
       }
       bookings[p.key] = result;
       newArchive[room.name][p.key] = result;
