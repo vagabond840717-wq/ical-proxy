@@ -241,7 +241,7 @@ async function syncAllRooms(env, withPush = false) {
       const result = await fetchAndParseIcal(p.url, p.type);
       if (result === null) {
         if (withPush) {
-          curr[room.name + '_' + p.key] = prev[room.name + '_' + p.key] || {};
+          // 오류 시 curr에 저장하지 않음 — prev 값은 저장 시 merge로 유지
           const failKey = `fail_${room.name}_${p.key}`;
           const failCount = parseInt(await env.PUSH_KV.get(failKey) || '0') + 1;
           await env.PUSH_KV.put(failKey, String(failCount));
@@ -320,7 +320,8 @@ async function syncAllRooms(env, withPush = false) {
   const newArchiveRaw = JSON.stringify(mergedArchive);
   if (newArchiveRaw !== prevArchiveRaw) await env.HANA_KV.put('booking_archive', newArchiveRaw);
   if (withPush) {
-    const newUidsRaw = JSON.stringify(curr);
+    const mergedCurr = { ...prev, ...curr };
+    const newUidsRaw = JSON.stringify(mergedCurr);
     if (newUidsRaw !== prevUidsRaw) await env.PUSH_KV.put('last_booking_uids', newUidsRaw);
   }
 
