@@ -2,7 +2,7 @@ name = "ical-proxy"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["* * * * *"]
 
 [[kv_namespaces]]
 binding = "HANA_KV"
