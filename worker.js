@@ -221,7 +221,10 @@ async function syncAllRooms(env, withPush = false) {
     ? new Set((await env.PUSH_KV.list({ prefix: 'fail_' })).keys.map(k => k.name))
     : new Set();
   const recoveryActions = []; // { room, platform } — 루프 후 일괄 처리
-  await Promise.all(rooms.map(async (room) => {
+  // 병렬 처리 결과를 호실 배열 순서대로 모아두고, 루프가 끝난 뒤 고정된 순서로 합친다
+  // (Promise.all 완료 순서는 매번 달라서, 그 순서로 바로 객체에 써넣으면 키 순서가 흔들려
+  //  내용이 같아도 JSON 문자열이 달라져 불필요한 KV 쓰기가 발생함)
+  const roomResults = await Promise.all(rooms.map(async (room) => {
     const prevRoomData = prevSynced[room.name] || {};
     const bookings = {
       ab: prevRoomData.ab || [],
@@ -230,6 +233,7 @@ async function syncAllRooms(env, withPush = false) {
       lv: prevRoomData.lv || [],
     };
     newArchive[room.name] = { ab: [], bk: [], tr: [], lv: [] };
+    const roomCurr = {};
     const platforms = [
       { key: 'ab', url: room.url,   label: 'Airbnb',      type: 'airbnb'  },
       { key: 'bk', url: room.bkUrl, label: 'Booking.com', type: 'booking' },
@@ -274,7 +278,7 @@ async function syncAllRooms(env, withPush = false) {
         const prevData = prev[room.name + '_' + p.key] || {};
         const prevUids = Array.isArray(prevData) ? prevData : Object.keys(prevData);
         const prevMap = Array.isArray(prevData) ? {} : prevData;
-        curr[room.name + '_' + p.key] = bookingMap;
+        roomCurr[p.key] = bookingMap;
         const newOnes = uids.filter(u => !prevUids.includes(u));
         const cancelled = prevUids.filter(u => !uids.includes(u));
         const sixMonthsLater = new Date();
@@ -288,8 +292,18 @@ async function syncAllRooms(env, withPush = false) {
         }
       }
     }
-    synced_bookings[room.name] = bookings;
+    return { name: room.name, bookings, roomCurr };
   }));
+  // 고정된 호실 순서(rooms 배열 순서) + 고정된 플랫폼 순서(ab,bk,tr,lv)로 합쳐서
+  // 매번 같은 키 순서가 나오도록 보장
+  for (const r of roomResults) {
+    synced_bookings[r.name] = r.bookings;
+    if (withPush) {
+      for (const key of ['ab', 'bk', 'tr', 'lv']) {
+        if (r.roomCurr[key]) curr[r.name + '_' + key] = r.roomCurr[key];
+      }
+    }
+  }
   // 아카이브 병합: synced_bookings와 완전 분리된 별도 저장
   const cutoff = new Date();
   cutoff.setMonth(cutoff.getMonth() - 13);
