@@ -216,10 +216,6 @@ async function syncAllRooms(env, withPush = false) {
   const curr = {};
   // 복구 감지용: 루프 시작 전 현재 미확인 오류 이벤트 목록을 1회 로드
   const cachedEvents = withPush ? JSON.parse(await env.PUSH_KV.get('events') || '[]') : [];
-  // fail_ 키가 실제로 존재하는 것만 미리 파악 → 성공 시 불필요한 delete 방지 (KV write 한도 절약)
-  const hotFailKeys = withPush
-    ? new Set((await env.PUSH_KV.list({ prefix: 'fail_' })).keys.map(k => k.name))
-    : new Set();
   const recoveryActions = []; // { room, platform } — 루프 후 일괄 처리
   // 병렬 처리 결과를 호실 배열 순서대로 모아두고, 루프가 끝난 뒤 고정된 순서로 합친다
   // (Promise.all 완료 순서는 매번 달라서, 그 순서로 바로 객체에 써넣으면 키 순서가 흔들려
@@ -262,7 +258,8 @@ async function syncAllRooms(env, withPush = false) {
         // 복구 감지: 이번 성공 전에 미확인 오류 알림이 있었으면 복구 처리 예약
         const hadError = cachedEvents.some(e => e.type === 'error' && !e.read && e.room === room.name && e.platform === p.label);
         if (hadError) recoveryActions.push({ room: room.name, platform: p.label });
-        if (hotFailKeys.has(failKey)) await env.PUSH_KV.delete(failKey);
+        // 목록 전체를 훑어보는(list) 대신, 그 키 하나만 콕 찍어 확인(get) → 나열 한도 대신 여유로운 읽기 한도 사용
+        if (await env.PUSH_KV.get(failKey) !== null) await env.PUSH_KV.delete(failKey);
       }
       bookings[p.key] = result;
       newArchive[room.name][p.key] = result;
