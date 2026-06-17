@@ -283,6 +283,11 @@ async function syncAllRooms(env, withPush = false) {
         for (const uid of newOnes) {
           const b = bookingMap[uid];
           if (new Date(b.cinY, b.cinM, b.cinD) > sixMonthsLater) continue;
+          // KV 동기화 지연으로 last_booking_uids가 stale할 수 있으므로 events 목록으로 중복 방지
+          const alreadyNotified = cachedEvents.some(e =>
+            e.type === 'new' && e.room === room.name && e.platform === p.label && e.cin === b.cin && e.cout === b.cout
+          );
+          if (alreadyNotified) continue;
           const msg = { title: `📅 ${room.name} 새 예약`, body: `${p.label} ${b.cin}~${b.cout}`, room: room.name };
           await sendPushToAll(env, msg);
           await saveEvent(env, { type: 'new', room: room.name, platform: p.label, cin: b.cin, cout: b.cout, ts: Date.now() });
