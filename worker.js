@@ -275,7 +275,8 @@ async function syncAllRooms(env, withPush = false) {
         const prevData = prev[room.name + '_' + p.key] || {};
         const prevUids = Array.isArray(prevData) ? prevData : Object.keys(prevData);
         const prevMap = Array.isArray(prevData) ? {} : prevData;
-        roomCurr[p.key] = bookingMap;
+        // 빈 응답이면 기억표 덮어쓰지 않음 — iCal 오류로 빈 결과가 왔을 때 기존 기록 보존
+        if (result.length > 0) roomCurr[p.key] = bookingMap;
         const newOnes = uids.filter(u => !prevUids.includes(u));
         const cancelled = prevUids.filter(u => !uids.includes(u));
         const sixMonthsLater = new Date();
@@ -283,11 +284,6 @@ async function syncAllRooms(env, withPush = false) {
         for (const uid of newOnes) {
           const b = bookingMap[uid];
           if (new Date(b.cinY, b.cinM, b.cinD) > sixMonthsLater) continue;
-          // KV 동기화 지연으로 last_booking_uids가 stale할 수 있으므로 events 목록으로 중복 방지
-          const alreadyNotified = cachedEvents.some(e =>
-            e.type === 'new' && e.room === room.name && e.platform === p.label && e.cin === b.cin && e.cout === b.cout
-          );
-          if (alreadyNotified) continue;
           const msg = { title: `📅 ${room.name} 새 예약`, body: `${p.label} ${b.cin}~${b.cout}`, room: room.name };
           await sendPushToAll(env, msg);
           await saveEvent(env, { type: 'new', room: room.name, platform: p.label, cin: b.cin, cout: b.cout, ts: Date.now() });
@@ -425,17 +421,29 @@ function parseIcal(text, platform) {
 }
 
 async function exportIcal(env, roomName) {
-  const data = await env.HANA_KV.get('synced_bookings');
-  if (!data) return new Response(emptyIcal(roomName), { headers: { 'Content-Type': 'text/calendar; charset=utf-8' } });
-  const roomBookings = JSON.parse(data)[roomName];
-  if (!roomBookings) return new Response(emptyIcal(roomName), { headers: { 'Content-Type': 'text/calendar; charset=utf-8' } });
   const lbl = { ab: 'Airbnb', bk: 'Booking.com', tr: 'Trip.com', lv: '리브애니웨어' };
   let events = '', uid = 1;
-  for (const [key, bks] of Object.entries(roomBookings)) {
-    for (const bk of bks) {
-      const ds = `${bk.cinY}${String(bk.cinM+1).padStart(2,'0')}${String(bk.cinD).padStart(2,'0')}`;
-      const de = `${bk.coutY}${String(bk.coutM+1).padStart(2,'0')}${String(bk.coutD).padStart(2,'0')}`;
-      events += `BEGIN:VEVENT\r\nUID:hana-${roomName}-${key}-${uid++}@vagabond1984.workers.dev\r\nDTSTART;VALUE=DATE:${ds}\r\nDTEND;VALUE=DATE:${de}\r\nSUMMARY:${lbl[key]||key} 예약 (${roomName})\r\nEND:VEVENT\r\n`;
+  const data = await env.HANA_KV.get('synced_bookings');
+  const roomBookings = data ? JSON.parse(data)[roomName] : null;
+  if (roomBookings) {
+    for (const [key, bks] of Object.entries(roomBookings)) {
+      for (const bk of bks) {
+        const ds = `${bk.cinY}${String(bk.cinM+1).padStart(2,'0')}${String(bk.cinD).padStart(2,'0')}`;
+        const de = `${bk.coutY}${String(bk.coutM+1).padStart(2,'0')}${String(bk.coutD).padStart(2,'0')}`;
+        events += `BEGIN:VEVENT\r\nUID:hana-${roomName}-${key}-${uid++}@vagabond1984.workers.dev\r\nDTSTART;VALUE=DATE:${ds}\r\nDTEND;VALUE=DATE:${de}\r\nSUMMARY:${lbl[key]||key} 예약 (${roomName})\r\nEND:VEVENT\r\n`;
+      }
+    }
+  }
+  const blocksRaw = await env.HANA_KV.get('extra_manual_blocks');
+  if (blocksRaw) {
+    const blocks = JSON.parse(blocksRaw);
+    const roomBlocks = Array.isArray(blocks) ? blocks.filter(b => b.roomName === roomName) : [];
+    for (const bl of roomBlocks) {
+      const ds = `${bl.startY}${String(bl.startM+1).padStart(2,'0')}${String(bl.startD).padStart(2,'0')}`;
+      const endDate = new Date(bl.endY, bl.endM, bl.endD);
+      endDate.setDate(endDate.getDate() + 1);
+      const de = `${endDate.getFullYear()}${String(endDate.getMonth()+1).padStart(2,'0')}${String(endDate.getDate()).padStart(2,'0')}`;
+      events += `BEGIN:VEVENT\r\nUID:hana-${roomName}-block-${uid++}@vagabond1984.workers.dev\r\nDTSTART;VALUE=DATE:${ds}\r\nDTEND;VALUE=DATE:${de}\r\nSUMMARY:Blocked\r\nEND:VEVENT\r\n`;
     }
   }
   return new Response(`BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//HANA STAY//KO\r\nCALSCALE:GREGORIAN\r\nX-WR-CALNAME:${roomName} 예약현황\r\n${events}END:VCALENDAR\r\n`, { headers: { 'Content-Type': 'text/calendar; charset=utf-8' } });
