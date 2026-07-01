@@ -261,7 +261,17 @@ async function syncAllRooms(env, withPush = false) {
         // 목록 전체를 훑어보는(list) 대신, 그 키 하나만 콕 찍어 확인(get) → 나열 한도 대신 여유로운 읽기 한도 사용
         if (await env.PUSH_KV.get(failKey) !== null) await env.PUSH_KV.delete(failKey);
       }
-      bookings[p.key] = result;
+      if (p.key === 'bk') {
+        const existingUids = new Set(bookings.bk.map(b => `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`));
+        const merged = [...bookings.bk];
+        for (const b of result) {
+          const uid = `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`;
+          if (!existingUids.has(uid)) merged.push(b);
+        }
+        bookings[p.key] = merged;
+      } else {
+        bookings[p.key] = result;
+      }
       newArchive[room.name][p.key] = result;
       if (withPush) {
         const bookingMap = {};
@@ -275,8 +285,9 @@ async function syncAllRooms(env, withPush = false) {
         const prevData = prev[room.name + '_' + p.key] || {};
         const prevUids = Array.isArray(prevData) ? prevData : Object.keys(prevData);
         const prevMap = Array.isArray(prevData) ? {} : prevData;
-        // 빈 응답이면 기억표 덮어쓰지 않음 — iCal 오류로 빈 결과가 왔을 때 기존 기록 보존
-        if (result.length > 0) roomCurr[p.key] = bookingMap;
+        // 실제 예약이 하나라도 있을 때만 기억표 갱신 — not available 블록만 있으면 빈 맵이 되어
+        // 기존 기록을 지워버리고 다음 싱크에서 이미 알림 보낸 예약을 신규로 오감지하는 버그 방지
+        if (uids.length > 0) roomCurr[p.key] = bookingMap;
         const newOnes = uids.filter(u => !prevUids.includes(u));
         const cancelled = prevUids.filter(u => !uids.includes(u));
         const sixMonthsLater = new Date();
@@ -412,9 +423,9 @@ function parseIcal(text, platform) {
       const desc = (block.match(/DESCRIPTION:(.+)/) || [])[1] || '';
       if (!desc.includes('airbnb.com/hosting/reservations')) continue;
     }
-    const oneMonthAgo = new Date(); oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1); oneMonthAgo.setHours(0,0,0,0);
+    const oneYearAgo = new Date(); oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1); oneYearAgo.setHours(0,0,0,0);
     const coutDate = new Date(cout.y, cout.m, cout.d);
-    if (coutDate < oneMonthAgo) continue;
+    if (coutDate < oneYearAgo) continue;
     bookings.push({ cinY: cin.y, cinM: cin.m, cinD: cin.d, coutY: cout.y, coutM: cout.m, coutD: cout.d, platform, summary });
   }
   return bookings;
