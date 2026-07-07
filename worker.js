@@ -324,9 +324,14 @@ async function syncAllRooms(env, withPush = false) {
     mergedArchive[room.name] = {};
     for (const key of ['ab', 'bk', 'tr', 'lv']) {
       const existing = prevRoom[key] || [];
+      // 플랫폼별 블락 구분 규칙이 다름:
+      // ab: "not available"만 블락 / bk: 실제 예약도 전부 "CLOSED - Not available"로 옴 → 전부 보존
+      // tr·lv: "not available"은 파서에서 이미 제거됨, 실제 예약은 제목이 비어 올 수 있음 → "closed"만 제외
       const incoming = (freshRoom[key] || []).filter(b => {
         const s = (b.summary || '').toLowerCase();
-        return !s.includes('not available') && s !== 'closed' && s !== '';
+        if (key === 'ab') return !s.includes('not available');
+        if (key === 'bk') return true;
+        return s !== 'closed';
       });
       const existingUids = new Set(existing.map(b => `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`));
       const merged = [...existing];
@@ -334,7 +339,19 @@ async function syncAllRooms(env, withPush = false) {
         const uid = `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`;
         if (!existingUids.has(uid)) merged.push(b);
       }
-      mergedArchive[room.name][key] = merged.filter(b => new Date(b.coutY, b.coutM, b.coutD) >= cutoff);
+      // 부분 스냅샷 제거: 같은 플랫폼에서 다른 항목 범위 안에 완전히 포함되면 잔재로 판단
+      // (Trip.com은 매일 "오늘~체크아웃" 형태로 시작일이 당겨진 피드를 보내 같은 숙박이 여러 장 쌓임.
+      //  같은 플랫폼에서 실제로 겹치는 예약은 존재할 수 없으므로 포함 관계 = 같은 숙박의 옛 버전)
+      const dn = (y, m, d) => new Date(y, m, d).getTime();
+      mergedArchive[room.name][key] = merged.filter(b => {
+        if (new Date(b.coutY, b.coutM, b.coutD) < cutoff) return false;
+        const bs = dn(b.cinY, b.cinM, b.cinD), be = dn(b.coutY, b.coutM, b.coutD);
+        return !merged.some(o => {
+          if (o === b) return false;
+          const os = dn(o.cinY, o.cinM, o.cinD), oe = dn(o.coutY, o.coutM, o.coutD);
+          return os <= bs && oe >= be && (os < bs || oe > be);
+        });
+      });
     }
   }
 
