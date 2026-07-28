@@ -261,17 +261,7 @@ async function syncAllRooms(env, withPush = false) {
         // 목록 전체를 훑어보는(list) 대신, 그 키 하나만 콕 찍어 확인(get) → 나열 한도 대신 여유로운 읽기 한도 사용
         if (await env.PUSH_KV.get(failKey) !== null) await env.PUSH_KV.delete(failKey);
       }
-      if (p.key === 'bk') {
-        const existingUids = new Set(bookings.bk.map(b => `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`));
-        const merged = [...bookings.bk];
-        for (const b of result) {
-          const uid = `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`;
-          if (!existingUids.has(uid)) merged.push(b);
-        }
-        bookings[p.key] = merged;
-      } else {
-        bookings[p.key] = result;
-      }
+      bookings[p.key] = result;
       newArchive[room.name][p.key] = result;
       if (withPush) {
         const bookingMap = {};
