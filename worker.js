@@ -446,8 +446,17 @@ async function exportIcal(env, roomName) {
   if (roomBookings) {
     for (const [key, bks] of Object.entries(roomBookings)) {
       for (const bk of bks) {
+        // 에어비앤비 "Not Available"을 그대로 내보내면 에어비앤비가 다시 읽어들여 순환 발생 → 제외
+        if (bk.summary?.toLowerCase().includes('not available')) continue;
+
         const ds = `${bk.cinY}${String(bk.cinM+1).padStart(2,'0')}${String(bk.cinD).padStart(2,'0')}`;
-        const de = `${bk.coutY}${String(bk.coutM+1).padStart(2,'0')}${String(bk.coutD).padStart(2,'0')}`;
+
+        // 트립닷컴/부킹닷컴의 체크아웃일은 예약 가능일 — 에어비앤비가 DTEND를 포함으로 읽어
+        // 체크아웃 당일까지 블락하는 걸 막기 위해 하루 앞당겨서 내보냄
+        let coutDate = new Date(bk.coutY, bk.coutM, bk.coutD);
+        if (key === 'tr' || key === 'bk') coutDate.setDate(coutDate.getDate() - 1);
+        const de = `${coutDate.getFullYear()}${String(coutDate.getMonth()+1).padStart(2,'0')}${String(coutDate.getDate()).padStart(2,'0')}`;
+
         events += `BEGIN:VEVENT\r\nUID:hana-${roomName}-${key}-${uid++}@vagabond1984.workers.dev\r\nDTSTART;VALUE=DATE:${ds}\r\nDTEND;VALUE=DATE:${de}\r\nSUMMARY:${lbl[key]||key} 예약 (${roomName})\r\nEND:VEVENT\r\n`;
       }
     }
