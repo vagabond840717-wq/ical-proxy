@@ -438,16 +438,46 @@ function parseIcal(text, platform) {
   return bookings;
 }
 
+// 부킹닷컴·트립닷컴은 실제 예약과 '판매 미오픈 기간'의 제목이 완전히 같다
+// (bk: 둘 다 "CLOSED - Not available" / tr: 둘 다 "RoomStatus Fully booked").
+// 두 채널은 오늘부터 6개월까지만 판매를 열어두므로, 그 범위 밖에서 끝나는 항목은
+// 실제 예약일 수 없다 = 전부 미오픈 기간. 체크인이 아니라 체크아웃으로 재야 한다.
+// (402호 트립 2027-01-01~06-15처럼 경계 안쪽에서 시작해 한참 뒤까지 뻗는 꼬리가 있음)
+// ⚠ 채널 쪽 판매 오픈 기간을 6개월로 정리한 뒤 켤 것. 기준선이 실제보다 짧으면 진짜 예약이 안 나가 오버부킹.
+const HORIZON_ENABLED  = false;
+const OPEN_MONTHS_BK_TR = 6;
+const GRACE_DAYS        = 7;   // 채널이 월말 단위로 끊는 등 미세하게 더 열어줄 여지
+
+const dayMs = (y, m, d) => Date.UTC(y, m, d);
+
+// 워커는 UTC로 도는데 숙소는 한국 → 9시간 보정해서 '한국 기준 오늘'을 구한다
+function todayKST() {
+  const n = new Date(Date.now() + 9 * 3600 * 1000);
+  return { y: n.getUTCFullYear(), m: n.getUTCMonth(), d: n.getUTCDate() };
+}
+
 async function exportIcal(env, roomName) {
   const lbl = { ab: 'Airbnb', bk: 'Booking.com', tr: 'Trip.com', lv: '리브애니웨어' };
   let events = '', uid = 1;
+  const t = todayKST();
+  const today   = dayMs(t.y, t.m, t.d);
+  const horizon = dayMs(t.y, t.m + OPEN_MONTHS_BK_TR, t.d + GRACE_DAYS);  // Date.UTC가 월/일 넘침을 보정
   const data = await env.HANA_KV.get('synced_bookings');
   const roomBookings = data ? JSON.parse(data)[roomName] : null;
   if (roomBookings) {
     for (const [key, bks] of Object.entries(roomBookings)) {
       for (const bk of bks) {
-        // 에어비앤비 "Not Available"을 그대로 내보내면 에어비앤비가 다시 읽어들여 순환 발생 → 제외
-        if (bk.summary?.toLowerCase().includes('not available')) continue;
+        // ① 에어비앤비 "Not Available"을 그대로 내보내면 에어비앤비가 다시 읽어들여 순환 발생 → 제외
+        //    제목으로 예약/블락이 구분되는 채널은 에어비앤비뿐이라 이 필터는 ab에만 건다.
+        //    (부킹닷컴은 실제 예약도 "CLOSED - Not available"로 와서, 예전엔 예약이 전부 걸러졌음 — 알려진이슈 #22)
+        if (key === 'ab' && bk.summary?.toLowerCase().includes('not available')) continue;
+
+        // ② 부킹·트립: 판매 오픈 범위 밖에서 끝나면 실제 예약일 수 없다 → 제외
+        if (HORIZON_ENABLED && (key === 'bk' || key === 'tr')
+            && dayMs(bk.coutY, bk.coutM, bk.coutD) > horizon) continue;
+
+        // ③ 이미 지난 예약은 오버부킹이 날 수 없다 → 내보내지 않음 (오늘 체크아웃은 유지)
+        if (dayMs(bk.coutY, bk.coutM, bk.coutD) < today) continue;
 
         const ds = `${bk.cinY}${String(bk.cinM+1).padStart(2,'0')}${String(bk.cinD).padStart(2,'0')}`;
 
@@ -464,6 +494,7 @@ async function exportIcal(env, roomName) {
     const blocks = JSON.parse(blocksRaw);
     const roomBlocks = Array.isArray(blocks) ? blocks.filter(b => b.roomName === roomName) : [];
     for (const bl of roomBlocks) {
+      if (dayMs(bl.endY, bl.endM, bl.endD) < today) continue;   // 지난 수동 블락은 내보낼 이유가 없다
       const ds = `${bl.startY}${String(bl.startM+1).padStart(2,'0')}${String(bl.startD).padStart(2,'0')}`;
       const endDate = new Date(bl.endY, bl.endM, bl.endD);
       endDate.setDate(endDate.getDate() + 1);
