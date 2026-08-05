@@ -451,11 +451,9 @@ async function exportIcal(env, roomName) {
 
         const ds = `${bk.cinY}${String(bk.cinM+1).padStart(2,'0')}${String(bk.cinD).padStart(2,'0')}`;
 
-        // 트립닷컴/부킹닷컴의 체크아웃일은 예약 가능일 — 에어비앤비가 DTEND를 포함으로 읽어
-        // 체크아웃 당일까지 블락하는 걸 막기 위해 하루 앞당겨서 내보냄
-        let coutDate = new Date(bk.coutY, bk.coutM, bk.coutD);
-        if (key === 'tr' || key === 'bk') coutDate.setDate(coutDate.getDate() - 1);
-        const de = `${coutDate.getFullYear()}${String(coutDate.getMonth()+1).padStart(2,'0')}${String(coutDate.getDate()).padStart(2,'0')}`;
+        // DTEND는 체크아웃일 그대로 — iCal에서 DTEND는 '포함 안 되는 날'이라 체크아웃 당일은
+        // 이미 예약 가능일로 나간다. 여기서 하루를 더 빼면 마지막 숙박일까지 열려 오버부킹.
+        const de = `${bk.coutY}${String(bk.coutM+1).padStart(2,'0')}${String(bk.coutD).padStart(2,'0')}`;
 
         events += `BEGIN:VEVENT\r\nUID:hana-${roomName}-${key}-${uid++}@vagabond1984.workers.dev\r\nDTSTART;VALUE=DATE:${ds}\r\nDTEND;VALUE=DATE:${de}\r\nSUMMARY:${lbl[key]||key} 예약 (${roomName})\r\nEND:VEVENT\r\n`;
       }
