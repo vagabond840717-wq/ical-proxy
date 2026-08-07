@@ -96,8 +96,18 @@ export default {
       await saveEvent(env, { type: 'test', room: '테스트', platform: 'HANA STAY', ts: Date.now() });
       return json({ ok: true, results }, request);
     }
+    // /ical/<호실명>        → 네 플랫폼 전부 (레거시. 동작 불변)
+    // /ical/<호실명>/<채널>  → 그 채널 자기 예약만 빼고 (ab|bk|tr|lv)
+    // 마지막 조각이 알려진 채널 키일 때만 채널로 해석 → 호실명에 영향 없음
     if (path.startsWith('/ical/')) {
-      return await exportIcal(env, decodeURIComponent(path.replace('/ical/', '')));
+      const rest = decodeURIComponent(path.slice('/ical/'.length));
+      const cut = rest.lastIndexOf('/');
+      let roomName = rest, target = null;
+      if (cut > 0) {
+        const tail = rest.slice(cut + 1);
+        if (EXPORT_TARGETS.includes(tail)) { target = tail; roomName = rest.slice(0, cut); }
+      }
+      return await exportIcal(env, roomName, target);
     }
     const icalUrl = url.searchParams.get('url');
     if (!icalUrl) return json({ error: 'url 파라미터 없음' }, request, 400);
@@ -448,6 +458,9 @@ const HORIZON_ENABLED  = false;
 const OPEN_MONTHS_BK_TR = 6;
 const GRACE_DAYS        = 7;   // 채널이 월말 단위로 끊는 등 미세하게 더 열어줄 여지
 
+// 채널 전용 내보내기 주소 (/ical/<호실>/<키>). 그 채널 자기 예약만 빼고 내보낸다.
+const EXPORT_TARGETS = ['ab', 'bk', 'tr', 'lv'];
+
 const dayMs = (y, m, d) => Date.UTC(y, m, d);
 
 // 워커는 UTC로 도는데 숙소는 한국 → 9시간 보정해서 '한국 기준 오늘'을 구한다
@@ -456,7 +469,9 @@ function todayKST() {
   return { y: n.getUTCFullYear(), m: n.getUTCMonth(), d: n.getUTCDate() };
 }
 
-async function exportIcal(env, roomName) {
+// target = null                → 레거시 통합 주소 (/ical/<호실>). 동작을 절대 바꾸지 않는다
+// target = 'ab'|'bk'|'tr'|'lv'  → 그 채널 전용 주소. 자기 예약을 돌려주지 않는다
+async function exportIcal(env, roomName, target = null) {
   const lbl = { ab: 'Airbnb', bk: 'Booking.com', tr: 'Trip.com', lv: '리브애니웨어' };
   let events = '', uid = 1;
   const t = todayKST();
@@ -466,11 +481,17 @@ async function exportIcal(env, roomName) {
   const roomBookings = data ? JSON.parse(data)[roomName] : null;
   if (roomBookings) {
     for (const [key, bks] of Object.entries(roomBookings)) {
+      // ⓪ 채널 전용 주소: 그 채널 자기 예약은 돌려주지 않는다.
+      //    돌려주면 채널이 "남의 달력에서 온 블락"으로 인식해 자기 iCal에서 빼버린다.
+      //    2026-08-06 부킹닷컴 603호 9/8~9/12 실제 발생 (05-known-issues #26).
+      if (target && key === target) continue;
+
       for (const bk of bks) {
-        // ① 에어비앤비 "Not Available"을 그대로 내보내면 에어비앤비가 다시 읽어들여 순환 발생 → 제외
-        //    제목으로 예약/블락이 구분되는 채널은 에어비앤비뿐이라 이 필터는 ab에만 건다.
-        //    (부킹닷컴은 실제 예약도 "CLOSED - Not available"로 와서, 예전엔 예약이 전부 걸러졌음 — 알려진이슈 #22)
-        if (key === 'ab' && bk.summary?.toLowerCase().includes('not available')) continue;
+        // ① 에어비앤비 "Not Available" 처리
+        //    레거시 주소는 모두가 공유하므로 내보내면 에어비앤비가 되읽어 순환 → 제외 (현행 유지).
+        //    채널 전용 주소는 ⓪에서 에어비앤비가 이미 걸러지므로 순환 위험이 없다 →
+        //    블락을 내보내야 트립·부킹이 그 날짜를 막는다. (막았는데 안 나가던 구멍 해소)
+        if (!target && key === 'ab' && bk.summary?.toLowerCase().includes('not available')) continue;
 
         // ② 부킹·트립: 판매 오픈 범위 밖에서 끝나면 실제 예약일 수 없다 → 제외
         if (HORIZON_ENABLED && (key === 'bk' || key === 'tr')
@@ -481,11 +502,24 @@ async function exportIcal(env, roomName) {
 
         const ds = `${bk.cinY}${String(bk.cinM+1).padStart(2,'0')}${String(bk.cinD).padStart(2,'0')}`;
 
+        // 에어비앤비 블락은 예약이 아니다. 채널 전용 주소에서만 나간다 (①에서 레거시는 걸러짐)
+        const isBlk = key === 'ab' && bk.summary?.toLowerCase().includes('not available');
+
         // DTEND는 체크아웃일 그대로 — iCal에서 DTEND는 '포함 안 되는 날'이라 체크아웃 당일은
         // 이미 예약 가능일로 나간다. 여기서 하루를 더 빼면 마지막 숙박일까지 열려 오버부킹.
-        const de = `${bk.coutY}${String(bk.coutM+1).padStart(2,'0')}${String(bk.coutD).padStart(2,'0')}`;
+        //
+        // ⚠ 단, 에어비앤비 블락만 예외다. parseIcal이 저장할 때 DTEND에서 하루를 빼
+        //   cout = '막힌 마지막 날'(포함)로 바꿔놨다. 그대로 내보내면 길이 0이 되어 아무것도 안 막는다.
+        //   → 하루를 도로 더해 exclusive 로 되돌린다. 수동 블락(아래)과 같은 처리.
+        let deY = bk.coutY, deM = bk.coutM, deD = bk.coutD;
+        if (isBlk) {
+          const e = new Date(bk.coutY, bk.coutM, bk.coutD);
+          e.setDate(e.getDate() + 1);
+          deY = e.getFullYear(); deM = e.getMonth(); deD = e.getDate();
+        }
+        const de = `${deY}${String(deM+1).padStart(2,'0')}${String(deD).padStart(2,'0')}`;
 
-        events += `BEGIN:VEVENT\r\nUID:hana-${roomName}-${key}-${uid++}@vagabond1984.workers.dev\r\nDTSTART;VALUE=DATE:${ds}\r\nDTEND;VALUE=DATE:${de}\r\nSUMMARY:${lbl[key]||key} 예약 (${roomName})\r\nEND:VEVENT\r\n`;
+        events += `BEGIN:VEVENT\r\nUID:hana-${roomName}-${key}-${uid++}@vagabond1984.workers.dev\r\nDTSTART;VALUE=DATE:${ds}\r\nDTEND;VALUE=DATE:${de}\r\nSUMMARY:${lbl[key]||key} ${isBlk ? '블락' : '예약'} (${roomName})\r\nEND:VEVENT\r\n`;
       }
     }
   }
