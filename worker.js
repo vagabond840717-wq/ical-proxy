@@ -39,7 +39,21 @@ export default {
     }
     if (path === '/bookings' && request.method === 'GET') {
       const data = await env.HANA_KV.get('synced_bookings');
-      return new Response(data || '{}', { headers: { 'Content-Type': 'application/json', ...cors(request) } });
+      // 화면용 — 트립 당일잠금 가짜 블락을 걷어내고 준다. KV 원본과 내보내기는 그대로 (05-known-issues #28)
+      try {
+        const fixed = applyDaylock(JSON.parse(data || '{}'), await readDaylock(env));
+        return new Response(JSON.stringify(fixed), { headers: { 'Content-Type': 'application/json', ...cors(request) } });
+      } catch (e) {
+        return new Response(data || '{}', { headers: { 'Content-Type': 'application/json', ...cors(request) } });
+      }
+    }
+    // 트립 당일잠금 판정 상태 — 진단용 읽기 전용
+    if (path === '/daylock' && request.method === 'GET') {
+      return json(await readDaylock(env), request);
+    }
+    // 소급 청소 (1회성). ?dry=1 이면 무엇을 바꿀지 보여주기만 하고 쓰지 않는다.
+    if (path === '/daylock/backfill' && request.method === 'POST') {
+      return json(await backfillDaylock(env, url.searchParams.get('dry') === '1'), request);
     }
     if (path === '/archive' && request.method === 'GET') {
       const data = await env.HANA_KV.get('booking_archive');
@@ -116,7 +130,14 @@ export default {
       const hostname = new URL(fetchUrl).hostname;
       if (!ALLOWED.some(d => hostname === d || hostname.endsWith('.' + d))) return json({ error: '허용되지 않은 도메인' }, request, 403);
       const resp = await fetch(fetchUrl);
-      return new Response(await resp.text(), { headers: { 'Content-Type': 'text/calendar', ...cors(request) } });
+      let text = await resp.text();
+      // fix=tr&room=<호실> 옵트인 — 청소앱 전용. 트립 당일잠금 가짜 블락을 걷어낸 판을 준다.
+      // ⚠ 파라미터가 없으면 원본 바이트 그대로. #28 판별 순서 1번("원본을 받아 대조")을 오염시키면 안 된다.
+      //   교정할 게 없어도 원본 그대로 — 재생성조차 하지 않는다.
+      if (url.searchParams.get('fix') === 'tr' && hostname.endsWith('ctrip.com')) {
+        try { text = await fixTripIcalText(env, text, url.searchParams.get('room')); } catch (e) {}
+      }
+      return new Response(text, { headers: { 'Content-Type': 'text/calendar', ...cors(request) } });
     } catch (e) { return json({ error: e.message }, request, 500); }
   },
 
@@ -313,6 +334,16 @@ async function syncAllRooms(env, withPush = false) {
       }
     }
   }
+  // 트립 당일잠금 판정 — 갓 받은 피드로 판단해야 하므로 여기서 한 번만 돌린다.
+  // 실패해도 sync 결과는 지켜야 하므로 삼킨다 (교정 안 함 = 지금까지와 동일 동작).
+  let daylock = {};
+  try { daylock = await updateDaylock(env, synced_bookings); } catch (e) {}
+
+  // ⚠ 아카이브에는 교정본을 넣는다. 아래 '부분 스냅샷 제거'는 포함되는 짧은 쪽을 버리는데,
+  //   가짜 잠금은 예약을 항상 길게 만들어 매번 가짜가 이긴다 (8/26~8/30 이 8/27~8/30 을 밀어냄).
+  //   장부는 되돌릴 수 없으므로 들어오기 전에 거른다. synced_bookings 원본은 손대지 않는다.
+  const freshArchive = applyDaylock(newArchive, daylock);
+
   // 아카이브 병합: synced_bookings와 완전 분리된 별도 저장
   const cutoff = new Date();
   cutoff.setMonth(cutoff.getMonth() - 13);
@@ -320,7 +351,7 @@ async function syncAllRooms(env, withPush = false) {
   const mergedArchive = {};
   for (const room of rooms) {
     const prevRoom = prevArchive[room.name] || {};
-    const freshRoom = newArchive[room.name] || {};
+    const freshRoom = freshArchive[room.name] || {};
     mergedArchive[room.name] = {};
     for (const key of ['ab', 'bk', 'tr', 'lv']) {
       const existing = prevRoom[key] || [];
@@ -467,6 +498,202 @@ const dayMs = (y, m, d) => Date.UTC(y, m, d);
 function todayKST() {
   const n = new Date(Date.now() + 9 * 3600 * 1000);
   return { y: n.getUTCFullYear(), m: n.getUTCMonth(), d: n.getUTCDate() };
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 트립 당일잠금 걷어내기 (trip-daylock)
+// ══════════════════════════════════════════════════════════════════════════
+// 왜: 트립 자동 규칙 '전략 제어 – 당일 객실 마감'이 매일 KST 17:59:59에 그날을 만실로 바꾸고
+//     다음날 07:00에 되돌린다 (05-known-issues #28). 트립 iCal은 손님 밤과 잠긴 밤을 똑같이
+//     'RoomStatus Fully booked'로 내보내고, 날짜가 맞닿으면 한 덩어리 VEVENT로 합쳐 보낸다.
+//     → 입실이 하루 당겨지거나(402호 9/1) 퇴실이 하루 밀려(#28) 보인다.
+//     파일 내용으로는 진짜 예약과 구분할 수 없다. 그래서 '시각'으로 가른다.
+// 자물쇠 2개, 둘 다 맞을 때만 걷어낸다:
+//   ① 안전창(07:30~17:30) 마지막 관측에 그 밤이 비어 있었다  → 손님이면 낮에도 막혀 있었을 것
+//   ② 18:00~18:10 차례에 처음 나타났다                       → 자동 규칙의 지문 (실측 18:00:57~18:01:01)
+// 하나라도 어긋나면 원본 그대로 둔다. 헷갈리면 무조건 막는 쪽 = 오버부킹이 나는 방향으로 안 틀린다.
+// 상세: docs/features/trip-daylock.md
+const SAFE_FROM_MIN = 7 * 60 + 30;    // KST 07:30 — 안전창 시작
+const SAFE_TO_MIN   = 17 * 60 + 30;   // KST 17:30 — 안전창 끝 (17:59:59 잠금 전)
+const LOCK_FROM_MIN = 18 * 60;        // KST 18:00 — 자물쇠 ②
+const LOCK_TO_MIN   = 18 * 60 + 10;   // KST 18:10 — 크론 지연 여유
+
+const ymdStr = (y, m, d) => `${y}${String(m + 1).padStart(2, '0')}${String(d).padStart(2, '0')}`;
+const ymdMs  = s => Date.UTC(+s.slice(0, 4), +s.slice(4, 6) - 1, +s.slice(6, 8));
+
+// todayKST + 자정부터 지난 분
+function kstNow() {
+  const n = new Date(Date.now() + 9 * 3600 * 1000);
+  return {
+    y: n.getUTCFullYear(), m: n.getUTCMonth(), d: n.getUTCDate(),
+    min: n.getUTCHours() * 60 + n.getUTCMinutes(),
+  };
+}
+
+// 밤 [ms, ms+1일) 이 조각에 덮이는가. cout는 exclusive이므로 cin <= ms < cout.
+const coversNight = (segs, ms) => (segs || []).some(b =>
+  dayMs(b.cinY, b.cinM, b.cinD) <= ms && ms < dayMs(b.coutY, b.coutM, b.coutD));
+
+// 그 밤 하나만 빼고 앞뒤 조각을 남긴다. 빈 조각은 버린다.
+//   [9/1,9/11) − 9/1밤  = [9/2,9/11)                입실 쪽
+//   [8/10,8/13) − 8/12밤 = [8/10,8/12)               퇴실 쪽
+//   [8/10,8/15) − 8/12밤 = [8/10,8/12)+[8/13,8/15)   양쪽 (경계 복원)
+//   [9/1,9/2)  − 9/1밤  = (사라짐)                   홀로
+function subtractNight(segs, ms) {
+  const next = ms + 86400000;
+  const mk = (a, z, b) => {
+    const A = new Date(a), Z = new Date(z);
+    return {
+      cinY: A.getUTCFullYear(), cinM: A.getUTCMonth(), cinD: A.getUTCDate(),
+      coutY: Z.getUTCFullYear(), coutM: Z.getUTCMonth(), coutD: Z.getUTCDate(),
+      platform: b.platform, summary: b.summary,
+    };
+  };
+  const out = [];
+  for (const b of segs || []) {
+    const s = dayMs(b.cinY, b.cinM, b.cinD), e = dayMs(b.coutY, b.coutM, b.coutD);
+    if (!(s <= ms && next <= e)) { out.push(b); continue; }   // 그 밤을 안 덮음 → 그대로
+    if (s < ms)   out.push(mk(s, ms, b));
+    if (next < e) out.push(mk(next, e, b));
+  }
+  return out;
+}
+
+// 매 sync 뒤 호출. 상태를 갱신하고 판정 결과를 돌려준다.
+// ⚠ fake 는 '오늘'이 아니라 '잠긴 밤'을 기억한다. 잠금은 18:00에 생겨 다음날 07:00까지 살아 있어서,
+//   '오늘' 기준으로 만들면 자정에 초기화돼 새벽 0~7시가 다시 틀린다 (사용자가 본 시각이 01:11이었다).
+async function updateDaylock(env, synced) {
+  const t = kstNow();
+  const today = ymdStr(t.y, t.m, t.d);
+  const raw = await env.HANA_KV.get('tr_daylock');
+  let st; try { st = JSON.parse(raw || '{}'); } catch (e) { st = {}; }
+  if (!st || typeof st !== 'object') st = {};
+  st.seen = st.seen || {};
+  st.fake = st.fake || {};
+  if (st.day !== today) { st.day = today; st.seen = {}; }   // fake 는 이월한다 (자정 넘김)
+
+  const inSafe = t.min >= SAFE_FROM_MIN && t.min <= SAFE_TO_MIN;
+  const inLock = t.min >= LOCK_FROM_MIN && t.min <= LOCK_TO_MIN;
+  const todayMs = dayMs(t.y, t.m, t.d);
+  const oldest  = dayMs(t.y, t.m, t.d - 1);   // 잠긴 밤이 어제보다 오래되면 버린다
+
+  for (const [room, data] of Object.entries(synced || {})) {
+    const tr = (data && data.tr) || [];
+    if (inSafe) {
+      st.seen[room] = coversNight(tr, todayMs);   // 낮 관측 갱신
+      delete st.fake[room];                       // 낮에는 잠금이 없다
+      continue;
+    }
+    // 이미 판정된 건: 피드가 그 밤을 더 이상 안 덮으면 스스로 정리 (07:00 해제 시 자동)
+    const f = st.fake[room];
+    if (f) {
+      const nightMs = ymdMs(f.night);
+      if (nightMs < oldest || !coversNight(tr, nightMs)) delete st.fake[room];
+      continue;
+    }
+    // 자물쇠 ① 안전창에 비어 있었다  +  ② 18:00~18:10 차례에 처음 나타났다
+    if (st.seen[room] === false && inLock && coversNight(tr, todayMs)) {
+      st.fake[room] = { night: today, min: t.min };
+    }
+  }
+
+  const next = JSON.stringify(st);
+  if (next !== (raw || '')) await env.HANA_KV.put('tr_daylock', next);   // 내용 바뀔 때만 write
+  return st;
+}
+
+// 판정 결과를 호실별 예약 묶음에 적용한다. tr 만 건드린다.
+function applyDaylock(rooms, st) {
+  if (!st || !st.fake || !Object.keys(st.fake).length) return rooms;
+  const out = {};
+  for (const [room, data] of Object.entries(rooms || {})) {
+    const f = st.fake[room];
+    out[room] = (f && data && data.tr)
+      ? { ...data, tr: subtractNight(data.tr, ymdMs(f.night)) }
+      : data;
+  }
+  return out;
+}
+
+// 읽기 경로(/bookings, /?url=&fix=tr)용 — KV에서 판정을 읽기만 한다. 쓰지 않는다.
+async function readDaylock(env) {
+  try { return JSON.parse(await env.HANA_KV.get('tr_daylock') || '{}'); } catch (e) { return {}; }
+}
+
+// 소급 청소 (1회성) — 8/25 재점화 이후 장부에 굳어버린 가짜를 교정한다.
+// 알림 로그(PUSH_KV 'events')에 KST 18:00~18:10 도장이 찍힌 트립 이벤트가 곧 가짜다.
+// ⚠ 삭제가 아니라 '그 밤만 빼기'다. 그냥 지우면 붙어 있던 진짜 숙박까지 사라진다.
+//    실측 검증: 8/26~8/30 에서 8/26밤을 빼면 8/27~8/30 — 트립이 다음날 07:00:55 에 보낸 값과 같다.
+// 멱등 — 이미 교정된 건은 장부에서 원본을 못 찾으므로 건너뛴다. 여러 번 눌러도 안전하다.
+async function backfillDaylock(env, dryRun) {
+  const evts = JSON.parse(await env.PUSH_KV.get('events') || '[]');
+  const archRaw = await env.HANA_KV.get('booking_archive') || '{}';
+  const archive = JSON.parse(archRaw);
+  const applied = [], skipped = [];
+  const same = (a, b) => a.cinY === b.cinY && a.cinM === b.cinM && a.cinD === b.cinD
+                      && a.coutY === b.coutY && a.coutM === b.coutM && a.coutD === b.coutD;
+
+  for (const ev of evts) {
+    if (ev.platform !== 'Trip.com' || !ev.cin || !ev.cout || !ev.ts) continue;
+    const k = new Date(ev.ts + 9 * 3600 * 1000);
+    const min = k.getUTCHours() * 60 + k.getUTCMinutes();
+    if (min < LOCK_FROM_MIN || min > LOCK_TO_MIN) continue;      // 18:00~18:10 도장만
+    const nightMs = Date.UTC(k.getUTCFullYear(), k.getUTCMonth(), k.getUTCDate());
+    const pd = s => s.split('/').map(Number);
+    const [ay, am, ad] = pd(ev.cin), [zy, zm, zd] = pd(ev.cout);
+    const target = { cinY: ay, cinM: am - 1, cinD: ad, coutY: zy, coutM: zm - 1, coutD: zd };
+    const label = `${ev.room} ${ev.cin}~${ev.cout} (${ev.cin} 밤 잠금)`;
+
+    const list = archive[ev.room] && archive[ev.room].tr;
+    const idx = list ? list.findIndex(b => same(b, target)) : -1;
+    if (idx < 0) { skipped.push(`${label} — 장부에 없음(이미 교정됨)`); continue; }
+
+    const fixed = subtractNight([list[idx]], nightMs)
+      .filter(f => !list.some((b, i) => i !== idx && same(b, f)));   // 중복 방지
+    list.splice(idx, 1, ...fixed);
+    applied.push(`${label} → ${fixed.length ? fixed.map(f =>
+      `${ymdStr(f.cinY, f.cinM, f.cinD)}~${ymdStr(f.coutY, f.coutM, f.coutD)}`).join(' + ') : '(삭제)'}`);
+  }
+  if (!dryRun && applied.length) await env.HANA_KV.put('booking_archive', JSON.stringify(archive));
+  return { dryRun: !!dryRun, count: applied.length, applied, skipped };
+}
+
+// 청소앱용 — iCal 원문에서 가짜 하룻밤만 도려낸다.
+// ⚠ 다시 만들지 않고 해당 VEVENT 블록의 날짜만 바꾼다. 나머지 줄(UID·DTSTAMP·SUMMARY·헤더·꼬리)은
+//   원문 그대로 지나간다. 청소앱 파서가 SUMMARY로 블락을 거르므로 제목이 바뀌면 안 된다.
+// 걸리는 게 없으면 원문을 그대로 돌려준다.
+async function fixTripIcalText(env, text, roomName) {
+  if (!roomName) return text;
+  const st = await readDaylock(env);
+  const f = st && st.fake && st.fake[roomName];
+  if (!f) return text;
+
+  const nightMs = ymdMs(f.night), nextMs = nightMs + 86400000;
+  const fmt = ms => { const d = new Date(ms); return ymdStr(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
+  const setDates = (blk, a, z) => blk
+    .replace(/(DTSTART(?:;[^:]*)?:)\d{8}/, `$1${a}`)
+    .replace(/(DTEND(?:;[^:]*)?:)\d{8}/,   `$1${z}`);
+
+  const parts = text.split('BEGIN:VEVENT');
+  let out = parts[0], changed = false;
+  for (let i = 1; i < parts.length; i++) {
+    // VEVENT 본문과 그 뒤 꼬리(END:VCALENDAR 등)를 나눠 둔다 — 마지막 블록을 지울 때 꼬리를 잃지 않게
+    const m = parts[i].match(/^([\s\S]*?END:VEVENT\r?\n?)([\s\S]*)$/);
+    const body = m ? m[1] : parts[i], tail = m ? m[2] : '';
+    const ds = (body.match(/DTSTART(?:;[^:]*)?:(\d{8})/) || [])[1];
+    const de = (body.match(/DTEND(?:;[^:]*)?:(\d{8})/)   || [])[1];
+    const s = ds ? ymdMs(ds) : null, e = de ? ymdMs(de) : null;
+
+    if (s === null || e === null || !(s <= nightMs && nextMs <= e)) {
+      out += 'BEGIN:VEVENT' + body + tail;                  // 그 밤을 안 덮음 → 원문 그대로
+      continue;
+    }
+    changed = true;
+    if (s < nightMs) out += 'BEGIN:VEVENT' + setDates(body, fmt(s), fmt(nightMs));
+    if (nextMs < e)  out += 'BEGIN:VEVENT' + setDates(body, fmt(nextMs), fmt(e));
+    out += tail;                                            // 둘 다 없으면 블록 자체가 사라진다
+  }
+  return changed ? out : text;
 }
 
 // target = null                → 레거시 통합 주소 (/ical/<호실>). 동작을 절대 바꾸지 않는다
