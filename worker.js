@@ -705,7 +705,21 @@ async function exportIcal(env, roomName, target = null) {
   const today   = dayMs(t.y, t.m, t.d);
   const horizon = dayMs(t.y, t.m + OPEN_MONTHS_BK_TR, t.d + GRACE_DAYS);  // Date.UTC가 월/일 넘침을 보정
   const data = await env.HANA_KV.get('synced_bookings');
-  const roomBookings = data ? JSON.parse(data)[roomName] : null;
+  let roomBookings = data ? JSON.parse(data)[roomName] : null;
+
+  // 트립 당일잠금 가짜 하룻밤 — 에어비앤비 전용 주소에서만 걷어낸다 (05-known-issues #28).
+  // 왜 ab 하나만인가: 그 밤을 팔 수 있는 채널이 하나뿐이어야 두 채널이 같은 밤을 동시에 파는
+  //   경쟁이 생기지 않는다. 트립은 자기가 잠갔고, 부킹·리브는 막힌 채로 둔다 (사용자 결정 2026-09-02).
+  // ⛔ 레거시 주소(target === null)에는 절대 적용하지 않는다 — 누가 구독 중인지 모르는 공용 문서라
+  //    한 줄만 바꿔도 전 채널이 동시에 영향받는다 (PLAN-per-channel-ical 경고).
+  // ⛔ /bk · /tr · /lv 도 적용 안 함. 여기 조건을 넓히려면 별도 승인.
+  // 수동 블락은 아래에서 별도 VEVENT로 나가므로 이 뺄셈이 닿지 않는다 → 사장님 블락이 항상 최종 결정권.
+  if (target === 'ab' && roomBookings) {
+    try {
+      roomBookings = applyDaylock({ [roomName]: roomBookings }, await readDaylock(env))[roomName];
+    } catch (e) { /* 교정 실패 시 원본 그대로 = 막은 채로 내보냄 (안전한 방향) */ }
+  }
+
   if (roomBookings) {
     for (const [key, bks] of Object.entries(roomBookings)) {
       // ⓪ 채널 전용 주소: 그 채널 자기 예약은 돌려주지 않는다.
