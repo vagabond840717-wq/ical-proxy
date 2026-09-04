@@ -648,7 +648,8 @@ const UNTRIM_PLATFORMS = ['bk', 'tr'];   // 앞잘림이 실측된 채널만. ab
 
 function untrimSegs(feed, arch, todayMs) {
   const yesterdayMs = todayMs - 86400000;
-  return (feed || []).map(b => {
+  let changed = false;
+  const out = (feed || []).map(b => {
     const bs = dayMs(b.cinY, b.cinM, b.cinD), be = dayMs(b.coutY, b.coutM, b.coutD);
     if (bs !== todayMs && bs !== yesterdayMs) return b;      // 잘림 자국이 아니다
     let best = null;
@@ -658,9 +659,29 @@ function untrimSegs(feed, arch, todayMs) {
       if (as < bs && (best === null || as < best)) best = as;
     }
     if (best === null) return b;
+    changed = true;
     const d = new Date(best);
     return { ...b, cinY: d.getUTCFullYear(), cinM: d.getUTCMonth(), cinD: d.getUTCDate() };
   });
+  return changed ? out : feed;      // 안 바뀌었으면 원본 배열 그대로 (불필요한 복사 방지)
+}
+
+// 오늘 퇴실인 예약을 아카이브에서 되살린다.
+// 왜: 채널이 '앞으로 못 파는 날'을 보내는데, 오늘 나가는 손님 때문에 막힐 날은 이제 없다
+//     → 목록에서 **통째로** 사라진다 (601호 부킹 9/3~9/5, 2026-09-05 실측).
+//     앱의 mergeArchiveIntoRooms 는 '퇴실 < 오늘'이라 하루 늦게 살아난다.
+//     그 하루가 하필 **청소하는 날**이라, 같은 날 교대(아웃→인)가 화면에서 '인'만 보인다.
+// 안전: 되살아나는 밤은 전부 지난 밤이고, 퇴실일은 cout-exclusive 라 안 막힌다 → 판매 무영향.
+//       내일이면 앱이 어차피 같은 걸 복원한다 — 하루 앞당길 뿐 새 위험이 아니다.
+// ⚠ 앞날 것은 절대 되살리지 않는다. 아카이브엔 취소분이 남아 있어 유령이 살아난다 (#16).
+function restoreTodayCheckouts(feed, arch, todayMs) {
+  const uid = b => `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`;
+  const have = new Set((feed || []).map(uid));
+  const add = (arch || []).filter(a =>
+    dayMs(a.coutY, a.coutM, a.coutD) === todayMs &&
+    dayMs(a.cinY, a.cinM, a.cinD) < todayMs &&      // 당일치기·꼬리 제외
+    !have.has(uid(a)));
+  return add.length ? [...(feed || []), ...add] : feed;
 }
 
 // 읽기 경로 전용. synced_bookings 원본도 아카이브도 쓰지 않는다.
@@ -672,11 +693,14 @@ async function applyUntrim(env, rooms) {
   const out = {};
   for (const [room, data] of Object.entries(rooms || {})) {
     let next = data;
-    for (const k of UNTRIM_PLATFORMS) {
-      const feed = data && data[k];
-      if (!feed || !feed.length) continue;
-      const fixed = untrimSegs(feed, (arch[room] || {})[k], todayMs);
-      if (fixed.some((s, i) => s !== feed[i])) next = { ...next, [k]: fixed };
+    for (const k of ['ab', 'bk', 'tr', 'lv']) {
+      const feed = (data && data[k]) || [];
+      const archK = (arch[room] || {})[k];
+      // ① 시작일 되돌리기 — 앞잘림이 실측된 채널만 (에어비앤비는 안 자른다)
+      let fixed = UNTRIM_PLATFORMS.includes(k) ? untrimSegs(feed, archK, todayMs) : feed;
+      // ② 오늘 퇴실 되살리기 — 전 채널. 앱의 '퇴실 < 오늘' 규칙을 하루 앞당기는 것뿐
+      fixed = restoreTodayCheckouts(fixed, archK, todayMs);
+      if (fixed !== feed) next = { ...next, [k]: fixed };
     }
     out[room] = next;
   }
@@ -751,6 +775,7 @@ async function fixIcalText(env, text, roomName, key) {
 
   const parts = text.split('BEGIN:VEVENT');
   let out = parts[0], changed = false;
+  const seen = new Set();
   for (let i = 1; i < parts.length; i++) {
     // VEVENT 본문과 그 뒤 꼬리(END:VCALENDAR 등)를 나눠 둔다 — 마지막 블록을 지울 때 꼬리를 잃지 않게
     const m = parts[i].match(/^([\s\S]*?END:VEVENT\r?\n?)([\s\S]*)$/);
@@ -782,9 +807,22 @@ async function fixIcalText(env, text, roomName, key) {
       return [best, z];
     });
 
-    for (const [a, z] of segs) out += 'BEGIN:VEVENT' + setDates(body, fmt(a), fmt(z));
+    for (const [a, z] of segs) { seen.add(a + '_' + z); out += 'BEGIN:VEVENT' + setDates(body, fmt(a), fmt(z)); }
     out += tail;                                            // segs 가 비면 블록 자체가 사라진다
   }
+
+  // ③ 오늘 퇴실인데 목록에서 통째로 사라진 예약을 아카이브에서 되살린다 (위 restoreTodayCheckouts 와 같은 규칙)
+  const summary = { bk: 'CLOSED - Not available', tr: 'RoomStatus Fully booked' }[key];
+  let extra = '', n = 0;
+  for (const a of arch) {
+    const az = dayMs(a.coutY, a.coutM, a.coutD), as = dayMs(a.cinY, a.cinM, a.cinD);
+    if (az !== todayMs || as >= todayMs || seen.has(as + '_' + az)) continue;
+    extra += `BEGIN:VEVENT\r\nDTSTART;VALUE=DATE:${fmt(as)}\r\nDTEND;VALUE=DATE:${fmt(az)}\r\n`
+           + `UID:hana-restored-${fmt(as)}-${n++}@vagabond1984.workers.dev\r\nSUMMARY:${a.summary || summary}\r\nEND:VEVENT\r\n`;
+    changed = true;
+  }
+  if (extra) out = out.replace('END:VCALENDAR', extra + 'END:VCALENDAR');
+
   return changed ? out : text;
 }
 
