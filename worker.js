@@ -39,9 +39,11 @@ export default {
     }
     if (path === '/bookings' && request.method === 'GET') {
       const data = await env.HANA_KV.get('synced_bookings');
-      // 화면용 — 트립 당일잠금 가짜 블락을 걷어내고 준다. KV 원본과 내보내기는 그대로 (05-known-issues #28)
+      // 화면용 — ① 트립 당일잠금 가짜 블락 제거 (#28) ② 부킹·트립 앞잘림 복원.
+      // KV 원본과 내보내기(exportIcal)는 그대로 둔다.
       try {
-        const fixed = applyDaylock(JSON.parse(data || '{}'), await readDaylock(env));
+        let fixed = applyDaylock(JSON.parse(data || '{}'), await readDaylock(env));
+        fixed = await applyUntrim(env, fixed);
         return new Response(JSON.stringify(fixed), { headers: { 'Content-Type': 'application/json', ...cors(request) } });
       } catch (e) {
         return new Response(data || '{}', { headers: { 'Content-Type': 'application/json', ...cors(request) } });
@@ -131,11 +133,14 @@ export default {
       if (!ALLOWED.some(d => hostname === d || hostname.endsWith('.' + d))) return json({ error: '허용되지 않은 도메인' }, request, 403);
       const resp = await fetch(fetchUrl);
       let text = await resp.text();
-      // fix=tr&room=<호실> 옵트인 — 청소앱 전용. 트립 당일잠금 가짜 블락을 걷어낸 판을 준다.
+      // fix=tr|bk & room=<호실> 옵트인 — 청소앱 전용. 예약앱(/bookings)과 같은 판을 준다.
+      //   tr → 당일잠금 가짜 블락 제거 + 앞잘림 복원 / bk → 앞잘림 복원
       // ⚠ 파라미터가 없으면 원본 바이트 그대로. #28 판별 순서 1번("원본을 받아 대조")을 오염시키면 안 된다.
       //   교정할 게 없어도 원본 그대로 — 재생성조차 하지 않는다.
-      if (url.searchParams.get('fix') === 'tr' && hostname.endsWith('ctrip.com')) {
-        try { text = await fixTripIcalText(env, text, url.searchParams.get('room')); } catch (e) {}
+      const fix = url.searchParams.get('fix');
+      const fixHost = { tr: 'ctrip.com', bk: 'booking.com' }[fix];
+      if (fixHost && hostname.endsWith(fixHost)) {
+        try { text = await fixIcalText(env, text, url.searchParams.get('room'), fix); } catch (e) {}
       }
       return new Response(text, { headers: { 'Content-Type': 'text/calendar', ...cors(request) } });
     } catch (e) { return json({ error: e.message }, request, 500); }
@@ -620,6 +625,64 @@ async function readDaylock(env) {
   try { return JSON.parse(await env.HANA_KV.get('tr_daylock') || '{}'); } catch (e) { return {}; }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// 앞잘림 되돌리기 (untrim)
+// ══════════════════════════════════════════════════════════════════════════
+// 왜: 부킹닷컴·트립닷컴은 iCal 로 '예약'이 아니라 '지금부터 못 파는 날'을 보낸다.
+//     제목이 그 차이를 그대로 말한다 — 부킹 'CLOSED - Not available' / 트립 'RoomStatus Fully booked'
+//     (재고 표현) vs 에어비앤비 'Reserved' (예약 표현).
+//     그래서 두 채널은 투숙 중인 손님이라도 지나간 밤을 목록에서 빼버린다.
+//     실측 2026-09-04: 601호 부킹 9/3~9/5 예약이 피드엔 9/4~9/5
+//                      402호 트립 9/2~9/11 예약이 피드엔 9/3~9/11
+//                      501호 에어비앤비 8/26 입실은 9일째 8/26 그대로 (안 자름)
+//     앱은 '막힘이 시작하는 칸'을 체크인으로 읽는다 → **어제 들어온 손님이 오늘 또 체크인으로 보인다.**
+// 무엇: 아카이브(매일 받아 적어둔 기록)에 '끝 날짜가 같고 시작만 더 이른' 조각이 있으면 시작일을 되돌린다.
+// 안전한 이유:
+//   - 되살아나는 건 **지난 밤뿐** → 팔 수 있는 날이 안 바뀐다 → 오버부킹이 날 길이 없다
+//   - exportIcal 은 synced_bookings 원본만 읽는다 → 내보내기 무영향. 이 교정은 화면 전용
+//   - 취소된 예약은 피드에 아예 없어 짝지을 상대가 없다 → 유령 부활 없음 (05-known-issues #16)
+//   - 조기 퇴실·연장은 cout 이 바뀌므로 짝이 안 맞는다 → 안 건드린다
+//   - 시작일이 오늘·어제일 때만 본다 → 판매 오픈 기간 '꼬리'(402호 12/1→1/1 롤오버)는 자동 제외
+// 상세: docs/features/untrim.md
+const UNTRIM_PLATFORMS = ['bk', 'tr'];   // 앞잘림이 실측된 채널만. ab 는 안 자른다
+
+function untrimSegs(feed, arch, todayMs) {
+  const yesterdayMs = todayMs - 86400000;
+  return (feed || []).map(b => {
+    const bs = dayMs(b.cinY, b.cinM, b.cinD), be = dayMs(b.coutY, b.coutM, b.coutD);
+    if (bs !== todayMs && bs !== yesterdayMs) return b;      // 잘림 자국이 아니다
+    let best = null;
+    for (const a of arch || []) {
+      if (dayMs(a.coutY, a.coutM, a.coutD) !== be) continue; // 끝 날짜가 같아야 같은 숙박
+      const as = dayMs(a.cinY, a.cinM, a.cinD);
+      if (as < bs && (best === null || as < best)) best = as;
+    }
+    if (best === null) return b;
+    const d = new Date(best);
+    return { ...b, cinY: d.getUTCFullYear(), cinM: d.getUTCMonth(), cinD: d.getUTCDate() };
+  });
+}
+
+// 읽기 경로 전용. synced_bookings 원본도 아카이브도 쓰지 않는다.
+async function applyUntrim(env, rooms) {
+  let arch;
+  try { arch = JSON.parse(await env.HANA_KV.get('booking_archive') || '{}'); } catch (e) { return rooms; }
+  const t = todayKST();
+  const todayMs = dayMs(t.y, t.m, t.d);
+  const out = {};
+  for (const [room, data] of Object.entries(rooms || {})) {
+    let next = data;
+    for (const k of UNTRIM_PLATFORMS) {
+      const feed = data && data[k];
+      if (!feed || !feed.length) continue;
+      const fixed = untrimSegs(feed, (arch[room] || {})[k], todayMs);
+      if (fixed.some((s, i) => s !== feed[i])) next = { ...next, [k]: fixed };
+    }
+    out[room] = next;
+  }
+  return out;
+}
+
 // 소급 청소 (1회성) — 8/25 재점화 이후 장부에 굳어버린 가짜를 교정한다.
 // 알림 로그(PUSH_KV 'events')에 KST 18:00~18:10 도장이 찍힌 트립 이벤트가 곧 가짜다.
 // ⚠ 삭제가 아니라 '그 밤만 빼기'다. 그냥 지우면 붙어 있던 진짜 숙박까지 사라진다.
@@ -658,17 +721,29 @@ async function backfillDaylock(env, dryRun) {
   return { dryRun: !!dryRun, count: applied.length, applied, skipped };
 }
 
-// 청소앱용 — iCal 원문에서 가짜 하룻밤만 도려낸다.
+// 청소앱용 — iCal 원문을 예약앱과 같은 판으로 맞춘다.
+//   ① 트립 당일잠금 가짜 하룻밤 도려내기 (key === 'tr' 일 때만)
+//   ② 부킹·트립 앞잘림 복원 — 잘려나간 시작일을 아카이브 값으로 되돌린다
 // ⚠ 다시 만들지 않고 해당 VEVENT 블록의 날짜만 바꾼다. 나머지 줄(UID·DTSTAMP·SUMMARY·헤더·꼬리)은
 //   원문 그대로 지나간다. 청소앱 파서가 SUMMARY로 블락을 거르므로 제목이 바뀌면 안 된다.
-// 걸리는 게 없으면 원문을 그대로 돌려준다.
-async function fixTripIcalText(env, text, roomName) {
-  if (!roomName) return text;
-  const st = await readDaylock(env);
-  const f = st && st.fake && st.fake[roomName];
-  if (!f) return text;
+// 걸리는 게 없으면 원문 그대로 돌려준다.
+async function fixIcalText(env, text, roomName, key) {
+  if (!roomName || !UNTRIM_PLATFORMS.includes(key)) return text;
 
-  const nightMs = ymdMs(f.night), nextMs = nightMs + 86400000;
+  // ① 당일잠금 — 트립만
+  let nightMs = null;
+  if (key === 'tr') {
+    const st = await readDaylock(env);
+    const f = st && st.fake && st.fake[roomName];
+    if (f) nightMs = ymdMs(f.night);
+  }
+  // ② 앞잘림 복원 재료
+  let arch = [];
+  try { arch = ((JSON.parse(await env.HANA_KV.get('booking_archive') || '{}')[roomName] || {})[key]) || []; } catch (e) {}
+  const t = todayKST();
+  const todayMs = dayMs(t.y, t.m, t.d), yesterdayMs = todayMs - 86400000;
+  if (nightMs === null && !arch.length) return text;
+
   const fmt = ms => { const d = new Date(ms); return ymdStr(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
   const setDates = (blk, a, z) => blk
     .replace(/(DTSTART(?:;[^:]*)?:)\d{8}/, `$1${a}`)
@@ -682,16 +757,33 @@ async function fixTripIcalText(env, text, roomName) {
     const body = m ? m[1] : parts[i], tail = m ? m[2] : '';
     const ds = (body.match(/DTSTART(?:;[^:]*)?:(\d{8})/) || [])[1];
     const de = (body.match(/DTEND(?:;[^:]*)?:(\d{8})/)   || [])[1];
-    const s = ds ? ymdMs(ds) : null, e = de ? ymdMs(de) : null;
+    if (!ds || !de) { out += 'BEGIN:VEVENT' + body + tail; continue; }
+    let s = ymdMs(ds); const e = ymdMs(de);
 
-    if (s === null || e === null || !(s <= nightMs && nextMs <= e)) {
-      out += 'BEGIN:VEVENT' + body + tail;                  // 그 밤을 안 덮음 → 원문 그대로
-      continue;
+    // ① 가짜 하룻밤을 먼저 걷어낸다 (조각이 둘로 갈릴 수 있다)
+    let segs = [[s, e]];
+    if (nightMs !== null && s <= nightMs && nightMs + 86400000 <= e) {
+      segs = [];
+      if (s < nightMs) segs.push([s, nightMs]);
+      if (nightMs + 86400000 < e) segs.push([nightMs + 86400000, e]);
+      changed = true;
     }
-    changed = true;
-    if (s < nightMs) out += 'BEGIN:VEVENT' + setDates(body, fmt(s), fmt(nightMs));
-    if (nextMs < e)  out += 'BEGIN:VEVENT' + setDates(body, fmt(nextMs), fmt(e));
-    out += tail;                                            // 둘 다 없으면 블록 자체가 사라진다
+    // ② 남은 조각의 시작이 오늘·어제면 아카이브에서 더 이른 시작을 찾아 되돌린다
+    segs = segs.map(([a, z]) => {
+      if (a !== todayMs && a !== yesterdayMs) return [a, z];
+      let best = null;
+      for (const x of arch) {
+        if (dayMs(x.coutY, x.coutM, x.coutD) !== z) continue;
+        const xs = dayMs(x.cinY, x.cinM, x.cinD);
+        if (xs < a && (best === null || xs < best)) best = xs;
+      }
+      if (best === null) return [a, z];
+      changed = true;
+      return [best, z];
+    });
+
+    for (const [a, z] of segs) out += 'BEGIN:VEVENT' + setDates(body, fmt(a), fmt(z));
+    out += tail;                                            // segs 가 비면 블록 자체가 사라진다
   }
   return changed ? out : text;
 }
