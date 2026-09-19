@@ -61,6 +61,14 @@ export default {
       const data = await env.HANA_KV.get('booking_archive');
       return new Response(data || '{}', { headers: { 'Content-Type': 'application/json', ...cors(request) } });
     }
+    // 과거 확정 원장 — 읽기 전용. from/to 는 "YYYY-MM" (생략 시 최근 13개월)
+    if (path === '/ledger' && request.method === 'GET') {
+      return json(await readLedger(env, url.searchParams.get('from'), url.searchParams.get('to')), request);
+    }
+    // 진단용 — 지금 굳히면 무엇이 굳는지. 안전창 밖이면 skipped 를 돌려준다
+    if (path === '/ledger/freeze' && request.method === 'POST') {
+      return json(await freezeLedger(env), request);
+    }
     if (path === '/push/subscribe' && request.method === 'POST') {
       const sub = await request.json();
       const key = 'sub_' + btoa(sub.endpoint).slice(0, 40).replace(/[+/=]/g, '');
@@ -147,7 +155,12 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(syncAllRooms(env, true));
+    ctx.waitUntil((async () => {
+      await syncAllRooms(env, true);
+      // 원장 굳히기는 동기화 성공 후에만. 실패하면 피드가 낡은 상태라 굳히면 안 된다.
+      // 여기서 던지면 sync 결과까지 오류로 묻히므로 삼킨다 — 5분 뒤 다음 tick 이 이어받는다.
+      try { await freezeLedger(env); } catch (e) {}
+    })());
   }
 };
 
@@ -705,6 +718,209 @@ async function applyUntrim(env, rooms) {
     out[room] = next;
   }
   return out;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 과거 확정 원장 (past-ledger) — 2026-09-19
+// ══════════════════════════════════════════════════════════════════════════
+// 왜: 채널은 지나간 예약을 피드에서 지운다(에어비앤비는 공식적으로 앞날만 내보낸다).
+//     그래서 지난 달력을 그리려면 어딘가 적어둬야 하는데, 지금은 booking_archive 가 그 일을 한다.
+//     아카이브는 '한 번이라도 본 모든 모양'이 쌓이는 곳이라 취소분·옛 버전·미오픈 꼬리가 섞여 있고,
+//     어느 것이 사실인지 가릴 근거가 없다. 그걸 화면 보정에 쓰다가 401호에 없던 15박이 그려졌다(#31).
+// 원장은 다르다 — **안전창에 '어제 하루'를 확정해 적고, 한 번 적은 날은 고치지 않는다.**
+//   - 확정 시점에 피드가 아직 들고 있는 값을 적는다 → 나중에 추측으로 메울 일이 없다
+//   - 취소는 확정 전에 피드에서 사라진다 → 애초에 안 들어온다 (#16)
+//   - 트립·부킹이 투숙 중에 앞을 잘라도(#29) 그 밤은 이미 적혀 있다
+// ⚠ 소급 채우기는 하지 않는다 (2026-09-19 사용자 결정) — 아카이브 오염을 원장에 영구히 굳히게 된다.
+//   원장은 도입일부터 쌓이고, 그 이전 과거는 기존 경로(아카이브) 그대로 그린다.
+// ⚠ 읽기 전용 소비자다. synced_bookings·booking_archive·tr_cuts 를 **쓰지 않는다.**
+//   exportIcal 도 건드리지 않으므로 전 채널 내보내기 무영향.
+// 저장: KV `ledger_YYYY-MM` = { 호실: { "YYYYMMDD": { ab:[{cin,cout}], bk:[], tr:[], lv:[] } } }
+//       KV `ledger_state`   = { frozenThrough:"YYYYMMDD", updated:"ISO" }
+// 상세: docs/features/DRAFT-past-ledger.md
+const LEDGER_MAX_DAYS_PER_RUN = 7;    // 장기 미가동 후 폭주 방지
+const LEDGER_MAX_MONTHS_READ  = 13;   // 조회 1회당 월 파일 상한
+
+const DAY = 86400000;
+const msToYmd = ms => { const d = new Date(ms); return ymdStr(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
+const msToMonthKey = ms => { const d = new Date(ms); return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`; };
+
+// 원장에 담을 자격 — 아카이브 병합(syncAllRooms)의 필터와 같은 규칙을 쓴다.
+//   ab: "not available"은 블락이라 제외 (블락은 manual_blocks·abBlocks 가 따로 다룬다)
+//   bk: 실제 예약도 "CLOSED - Not available"로 오므로 전부 보존
+//   tr·lv: 파서가 "not available"을 이미 걸렀고, 실제 예약은 제목이 빌 수 있다 → "closed"만 제외
+function ledgerKeep(key, b) {
+  const s = (b.summary || '').toLowerCase();
+  if (key === 'ab') return !s.includes('not available');
+  if (key === 'bk') return true;
+  return s !== 'closed';
+}
+
+// 경계 적용 — 예약앱 applyCuts() 와 동일 규칙 (booking/index.html:943).
+// 경계가 예약 한가운데(cin < 경계 < cout)일 때만 조각으로 치환. 양끝과 같으면 이미 나뉜 상태 → 무동작.
+// ⚠ 예약앱·청소앱에 이은 세 번째 복제다. 규칙을 바꾸면 3곳 동시 수정 (05-known-issues #2)
+function applyCutsForRoom(segs, cuts) {
+  if (!cuts || !cuts.length) return segs || [];
+  const out = [];
+  for (const b of segs || []) {
+    const bs = dayMs(b.cinY, b.cinM, b.cinD), be = dayMs(b.coutY, b.coutM, b.coutD);
+    const inside = cuts.map(c => dayMs(c.y, c.m, c.d)).filter(t => t > bs && t < be).sort((a, z) => a - z);
+    if (!inside.length) { out.push(b); continue; }
+    const pts = [bs, ...inside, be];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const a = new Date(pts[i]), z = new Date(pts[i + 1]);
+      out.push({
+        cinY: a.getUTCFullYear(), cinM: a.getUTCMonth(), cinD: a.getUTCDate(),
+        coutY: z.getUTCFullYear(), coutM: z.getUTCMonth(), coutD: z.getUTCDate(),
+        platform: b.platform || 'trip', summary: b.summary || '',
+      });
+    }
+  }
+  return out;
+}
+
+// 그 날짜 칸에 걸친 조각을 호실×플랫폼별로 모은다.
+// 걸침 판정은 `cin <= X <= cout` — cout 까지 포함해야 '체크아웃만 있는 날'을 잃지 않는다.
+//
+// ⛔ 재료에 booking_archive 를 쓰지 않는다.
+//    아카이브엔 취소분·옛 버전·미오픈 꼬리가 섞여 있다(실측: 진짜 예약 8건이 더 넓은 조각에 먹혀
+//    삭제돼 있고, 유령 63건이 퇴실일을 기다리고 있다). 보조 재료로 넣으면 그 오염이 원장에
+//    **영구히** 굳는다. 401호 `9/3~9/18` 이 정확히 그 경로로 들어온다.
+// 재료는 둘뿐 — **지금 피드** 와 **어제 원장**. 둘 다 확정된 사실이다.
+//   ① 투숙 중·오늘 걸친 예약 → 피드에 있다
+//   ② 어제 끝난 예약 → 채널이 이미 뺐지만 어제 원장에 적혀 있다 (cout == 오늘인 조각을 이어받는다)
+//
+// 입실일 고정 (#29) — 트립·부킹은 투숙 중에도 앞을 잘라 보낸다.
+//   같은 방·같은 채널에 겹치는 예약은 존재할 수 없으므로, **어젯밤을 덮고 오늘까지 이어지는
+//   어제 조각 = 같은 숙박**이다. 그 입실일을 물려받으면 매일 밀리는 일이 없다.
+function buildDaySegs(dayMsVal, roomNames, synced, cuts, prevDay) {
+  const dayStr = msToYmd(dayMsVal), prevStr = msToYmd(dayMsVal - DAY);
+  const out = {};
+  for (const name of roomNames) {
+    const entry = {};
+    for (const key of ['ab', 'bk', 'tr', 'lv']) {
+      const covers = arr => (arr || []).filter(b =>
+        dayMs(b.cinY, b.cinM, b.cinD) <= dayMsVal && dayMsVal <= dayMs(b.coutY, b.coutM, b.coutD));
+      let picked = covers(((synced[name] || {})[key] || []).filter(b => ledgerKeep(key, b)));
+      if (key === 'tr') {
+        const mine = (cuts || []).filter(c => c.roomName === name && c.platform === 'tr');
+        picked = covers(applyCutsForRoom(picked, mine));
+      }
+      const prevSegs = ((prevDay || {})[name] || {})[key] || [];
+      const seen = new Set(), list = [];
+      const add = (cin, cout) => {
+        const uid = cin + '_' + cout;
+        if (seen.has(uid)) return;
+        seen.add(uid); list.push({ cin, cout });
+      };
+      for (const b of picked) {
+        const cout = ymdStr(b.coutY, b.coutM, b.coutD);
+        let cin = ymdStr(b.cinY, b.cinM, b.cinD);
+        // 어젯밤(prevStr)을 덮고 오늘 이후까지 이어지는 어제 조각 = 같은 숙박 → 입실일 물려받기
+        const same = prevSegs.find(p => p.cin <= prevStr && prevStr < p.cout && p.cout > dayStr && p.cin < cin);
+        if (same) cin = same.cin;
+        add(cin, cout);
+      }
+      // 어제까지 확정됐고 오늘 퇴실인 조각 — 채널이 목록에서 이미 뺐어도 체크아웃 표시를 잃지 않는다
+      for (const p of prevSegs) {
+        if (p.cout === dayStr && p.cin <= prevStr) add(p.cin, p.cout);
+      }
+      if (list.length) entry[key] = list;
+    }
+    if (Object.keys(entry).length) out[name] = entry;
+  }
+  return out;
+}
+
+// 매 cron 에서 호출. 안전창 밖이면 즉시 반환, 이미 굳은 날은 건너뛴다 → 정상 운영 시 KV write 하루 1회.
+// 실패해도 5분 뒤 다음 tick 이 이어받는다 (멱등).
+async function freezeLedger(env) {
+  const now = kstNow();
+  // #28 — 트립이 17:59:59 에 그날을 만실로 바꾸고 다음날 07:00 에 되돌린다.
+  //   그 시간대 피드로 굳히면 틀린 상태가 영구 고착된다. 07:30 첫 tick 에 굳고 17:30 까지 재시도.
+  if (now.min < SAFE_FROM_MIN || now.min > SAFE_TO_MIN) return { skipped: 'safe-window', min: now.min };
+
+  const t = todayKST();
+  const yesterdayMs = dayMs(t.y, t.m, t.d) - DAY;
+
+  let state = {};
+  try { state = JSON.parse(await env.HANA_KV.get('ledger_state') || '{}'); } catch (e) { state = {}; }
+  // 소급 채우기 없음 — 처음 도는 날은 '어제' 하루만 굳힌다
+  let fromMs = state.frozenThrough ? ymdMs(state.frozenThrough) + DAY : yesterdayMs;
+  if (fromMs > yesterdayMs) return { skipped: 'up-to-date', frozenThrough: state.frozenThrough };
+  const span = (yesterdayMs - fromMs) / DAY + 1;
+  if (span > LEDGER_MAX_DAYS_PER_RUN) fromMs = yesterdayMs - (LEDGER_MAX_DAYS_PER_RUN - 1) * DAY;
+
+  const rooms = JSON.parse(await env.HANA_KV.get('rooms') || '[]');
+  if (!rooms.length) return { skipped: 'no-rooms' };
+  const roomNames = rooms.map(r => r.name);
+  const synced = JSON.parse(await env.HANA_KV.get('synced_bookings') || '{}');
+  let archive = {}; try { archive = JSON.parse(await env.HANA_KV.get('booking_archive') || '{}'); } catch (e) {}
+  let cuts = [];   try { cuts = JSON.parse(await env.HANA_KV.get('extra_tr_cuts') || '[]'); } catch (e) {}
+  if (!Array.isArray(cuts)) cuts = [];
+
+  const cache = {};                                   // "2026-09" → 그 달 원장
+  const loadMonth = async mk => {
+    if (!(mk in cache)) {
+      try { cache[mk] = JSON.parse(await env.HANA_KV.get('ledger_' + mk) || '{}'); } catch (e) { cache[mk] = {}; }
+    }
+    return cache[mk];
+  };
+
+  const dirty = new Set(), frozen = [];
+  for (let ms = fromMs; ms <= yesterdayMs; ms += DAY) {
+    const dayStr = msToYmd(ms), mk = msToMonthKey(ms);
+    const month = await loadMonth(mk);
+    // 전날 원장 — 달을 넘길 수 있으므로 해당 월 파일에서 읽는다 (입실일 상속용)
+    const prevMonth = await loadMonth(msToMonthKey(ms - DAY));
+    const prevDay = {};
+    for (const name of roomNames) {
+      const e = (prevMonth[name] || {})[msToYmd(ms - DAY)];
+      if (e) prevDay[name] = e;
+    }
+    const segs = buildDaySegs(ms, roomNames, synced, archive, cuts, prevDay);
+    for (const name of roomNames) {
+      if (!month[name]) month[name] = {};
+      // ⑤ 한 번 굳은 날은 안 바꾼다 — 이미 있으면 건너뛴다 (멱등)
+      if (month[name][dayStr]) continue;
+      if (segs[name]) { month[name][dayStr] = segs[name]; dirty.add(mk); }
+      else            { month[name][dayStr] = {};          dirty.add(mk); }   // 빈 날도 '확정된 빈 날'로 적는다
+    }
+    frozen.push(dayStr);
+  }
+
+  if (!dirty.size) {
+    // 이미 다 굳어 있었다 — state 만 앞당기고 월 파일은 안 쓴다
+    if (state.frozenThrough !== msToYmd(yesterdayMs)) {
+      await env.HANA_KV.put('ledger_state', JSON.stringify({ frozenThrough: msToYmd(yesterdayMs), updated: new Date().toISOString() }));
+    }
+    return { frozen: [], skipped: 'already-frozen' };
+  }
+  for (const mk of dirty) await env.HANA_KV.put('ledger_' + mk, JSON.stringify(cache[mk]));
+  await env.HANA_KV.put('ledger_state', JSON.stringify({ frozenThrough: msToYmd(yesterdayMs), updated: new Date().toISOString() }));
+  return { frozen, months: [...dirty] };
+}
+
+// 조회 — from/to 는 "YYYY-MM". 생략하면 최근 13개월.
+async function readLedger(env, from, to) {
+  let state = {};
+  try { state = JSON.parse(await env.HANA_KV.get('ledger_state') || '{}'); } catch (e) {}
+  const t = todayKST();
+  const end = to && /^\d{4}-\d{2}$/.test(to) ? to : `${t.y}-${String(t.m + 1).padStart(2, '0')}`;
+  const keys = [];
+  let [ey, em] = end.split('-').map(Number);
+  for (let i = 0; i < LEDGER_MAX_MONTHS_READ; i++) {
+    const mk = `${ey}-${String(em).padStart(2, '0')}`;
+    keys.push(mk);
+    if (from && mk === from) break;
+    em--; if (em === 0) { em = 12; ey--; }
+  }
+  const months = {};
+  for (const mk of keys) {
+    const raw = await env.HANA_KV.get('ledger_' + mk);
+    if (raw) { try { months[mk] = JSON.parse(raw); } catch (e) {} }
+  }
+  return { frozenThrough: state.frozenThrough || null, updated: state.updated || null, months };
 }
 
 // 소급 청소 (1회성) — 8/25 재점화 이후 장부에 굳어버린 가짜를 교정한다.
