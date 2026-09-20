@@ -687,13 +687,47 @@ function untrimSegs(feed, arch, todayMs) {
 // 안전: 되살아나는 밤은 전부 지난 밤이고, 퇴실일은 cout-exclusive 라 안 막힌다 → 판매 무영향.
 //       내일이면 앱이 어차피 같은 걸 복원한다 — 하루 앞당길 뿐 새 위험이 아니다.
 // ⚠ 앞날 것은 절대 되살리지 않는다. 아카이브엔 취소분이 남아 있어 유령이 살아난다 (#16).
-function restoreTodayCheckouts(feed, arch, todayMs) {
-  const uid = b => `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`;
-  const have = new Set((feed || []).map(uid));
-  const add = (arch || []).filter(a =>
-    dayMs(a.coutY, a.coutM, a.coutD) === todayMs &&
-    dayMs(a.cinY, a.cinM, a.cinD) < todayMs &&      // 당일치기·꼬리 제외
-    !have.has(uid(a)));
+//
+// ── 제외 조건 2개 (2026-09-21) ────────────────────────────────────────────
+// 아카이브는 "한 번이라도 본 모든 모양"이 쌓이는 곳이라 옛 버전이 섞여 있다.
+// 날짜 완전일치로만 "이미 있다"를 판정하니, 하루라도 줄어든 예약이 남남 취급돼 유령이 됐다.
+//   601호 실측 — 진짜 ab 9/18~9/20 / 아카이브 9/18~9/21 (옛 버전) → 오늘(9/21) 주입됨
+//   203호 실측 — 진짜 ab 9/19~9/21 / 아카이브 9/16~9/21 (옛 버전) → 오늘 주입됨
+//   그 뒤 앱의 '포함 관계 정리'가 넓은 쪽(가짜)을 남기고 진짜를 지워 화면에서 진짜가 사라졌다.
+//   2026-09-20 에는 진짜 ab 9/18~9/20 옆에 bk 9/17~9/20 · tr 9/9~9/20 이 같이 살아나
+//   퇴실 도장이 한 칸에 3개 찍혔다 (두 조각 모두 원본 피드에는 이미 없음을 직접 받아 확인).
+// (가) 그 방 어느 채널이든 겹치는 조각이 피드에 있으면 안 꺼낸다
+//      — 한 방에 한 팀이다 (사용자 확인 2026-09-21). 채널이 달라도 같은 밤을 두 팀이 쓸 수 없으므로,
+//        겹친다면 그 조각은 독립된 진짜 예약이 아니다 — 같은 숙박의 옛 버전이거나 채널 간 메아리다.
+//        피드 쪽이 최신이다. 이 검사가 옛 '날짜 완전일치'를 대체한다 (같은 조각도 겹치므로).
+//        ⚠ '같은 채널'로 좁히면 603호 사례를 놓친다 — bk 9/18~9/21(메아리)이 ab 9/15~9/20 과
+//          채널을 가로질러 겹쳤다. 사용자 확인 결과 603호는 9/20 에 비었다 (퇴실 없음).
+// (나) 그 방에 '오늘 퇴실'이 이미 표시돼 있으면 안 꺼낸다 (채널 무관)
+//      — 이 규칙의 목적이 '퇴실 표시가 사라지는 것' 방지이므로, 이미 보이면 꺼낼 이유가 없다.
+// ⚠ 같은 규칙이 청소앱 경로(fixIcalText ③)에도 있다. 판정은 shouldRestoreSeg 한 곳에만 둔다 (#2).
+// 상세: docs/features/ghost-restore-guard.md
+
+// 아카이브 조각 하나를 되살릴 것인가. 두 읽기 경로(/bookings, /?url=&fix=)가 같이 쓴다.
+//   as, az        : 조각의 시작·끝 (ms)
+//   roomSegs      : **그 방 네 채널 전부**의 [시작ms, 끝ms] 목록
+//   checkoutShown : 그 방에 '오늘 퇴실'이 이미 표시돼 있는가 (채널 무관)
+function shouldRestoreSeg(as, az, roomSegs, todayMs, checkoutShown) {
+  if (az !== todayMs || as >= todayMs) return false;    // 오늘 퇴실 + 당일치기·꼬리 제외 (기존 조건)
+  if (checkoutShown) return false;                      // (나)
+  return !(roomSegs || []).some(([s, e]) => as < e && s < az);   // (가) 하룻밤이라도 겹치면 제외
+}
+
+// ⚠ roomSegs 를 **제자리에서 늘린다.** 되살린 조각끼리도 겹치지 않게 하려는 것이고,
+//   호출부가 같은 배열을 네 채널에 걸쳐 넘기므로 채널을 가로지르는 누적도 이걸로 이뤄진다.
+function restoreTodayCheckouts(feed, arch, todayMs, roomSegs, checkoutShown) {
+  const add = [];
+  for (const a of arch || []) {
+    const as = dayMs(a.cinY, a.cinM, a.cinD), az = dayMs(a.coutY, a.coutM, a.coutD);
+    if (!shouldRestoreSeg(as, az, roomSegs, todayMs, checkoutShown)) continue;
+    roomSegs.push([as, az]);
+    checkoutShown = true;
+    add.push(a);
+  }
   return add.length ? [...(feed || []), ...add] : feed;
 }
 
@@ -705,15 +739,26 @@ async function applyUntrim(env, rooms) {
   const todayMs = dayMs(t.y, t.m, t.d);
   const out = {};
   for (const [room, data] of Object.entries(rooms || {})) {
+    const archR = arch[room] || {};
+    // ① 시작일 되돌리기 — 앞잘림이 실측된 채널만 (에어비앤비는 안 자른다).
+    //    되살리기 판단이 '그 방 전체'를 보므로, 네 채널을 먼저 다 펴 놓고 ②로 넘어간다.
+    const fixed = {};
+    for (const k of ['ab', 'bk', 'tr', 'lv']) {
+      const feed = (data && data[k]) || [];
+      fixed[k] = UNTRIM_PLATFORMS.includes(k) ? untrimSegs(feed, archR[k], todayMs) : feed;
+    }
+    // ② 오늘 퇴실 되살리기 — 판단 재료는 그 방 네 채널 전부다 (한 방에 한 팀)
+    const roomSegs = ['ab', 'bk', 'tr', 'lv'].flatMap(k =>
+      fixed[k].map(b => [dayMs(b.cinY, b.cinM, b.cinD), dayMs(b.coutY, b.coutM, b.coutD)]));
+    let checkoutShown = roomSegs.some(([, e]) => e === todayMs);
+    // 순서는 ab → bk → tr → lv 그대로. 에어비앤비만 '예약'(Reserved)을 보내고
+    // 나머지는 '재고 차단'이므로, 되살릴 자격은 에어비앤비가 먼저 갖는 게 맞다.
     let next = data;
     for (const k of ['ab', 'bk', 'tr', 'lv']) {
       const feed = (data && data[k]) || [];
-      const archK = (arch[room] || {})[k];
-      // ① 시작일 되돌리기 — 앞잘림이 실측된 채널만 (에어비앤비는 안 자른다)
-      let fixed = UNTRIM_PLATFORMS.includes(k) ? untrimSegs(feed, archK, todayMs) : feed;
-      // ② 오늘 퇴실 되살리기 — 전 채널. 앱의 '퇴실 < 오늘' 규칙을 하루 앞당기는 것뿐
-      fixed = restoreTodayCheckouts(fixed, archK, todayMs);
-      if (fixed !== feed) next = { ...next, [k]: fixed };
+      const restored = restoreTodayCheckouts(fixed[k], archR[k], todayMs, roomSegs, checkoutShown);
+      if (restored !== fixed[k]) { fixed[k] = restored; checkoutShown = true; }
+      if (fixed[k] !== feed) next = { ...next, [k]: fixed[k] };
     }
     out[room] = next;
   }
@@ -991,7 +1036,7 @@ async function fixIcalText(env, text, roomName, key) {
 
   const parts = text.split('BEGIN:VEVENT');
   let out = parts[0], changed = false;
-  const seen = new Set();
+  const seenSegs = [];                    // 이 피드가 실제로 내보내는 [시작ms, 끝ms] 목록
   for (let i = 1; i < parts.length; i++) {
     // VEVENT 본문과 그 뒤 꼬리(END:VCALENDAR 등)를 나눠 둔다 — 마지막 블록을 지울 때 꼬리를 잃지 않게
     const m = parts[i].match(/^([\s\S]*?END:VEVENT\r?\n?)([\s\S]*)$/);
@@ -1023,16 +1068,29 @@ async function fixIcalText(env, text, roomName, key) {
       return [best, z];
     });
 
-    for (const [a, z] of segs) { seen.add(a + '_' + z); out += 'BEGIN:VEVENT' + setDates(body, fmt(a), fmt(z)); }
+    // 겹침 판정을 해야 하므로 [시작, 끝] 그대로 모은다 (문자열 집합으로는 완전일치밖에 못 본다)
+    for (const [a, z] of segs) { seenSegs.push([a, z]); out += 'BEGIN:VEVENT' + setDates(body, fmt(a), fmt(z)); }
     out += tail;                                            // segs 가 비면 블록 자체가 사라진다
   }
 
-  // ③ 오늘 퇴실인데 목록에서 통째로 사라진 예약을 아카이브에서 되살린다 (위 restoreTodayCheckouts 와 같은 규칙)
+  // ③ 오늘 퇴실인데 목록에서 통째로 사라진 예약을 아카이브에서 되살린다
+  //    판정은 shouldRestoreSeg 한 곳에만 둔다 — 예약앱 경로(/bookings)와 같은 규칙이다 (#2)
+  // 판단 재료는 그 방 네 채널 전부다. 이 경로는 한 채널의 iCal 원문만 받으므로
+  // 나머지 채널은 장부에서 읽는다 (읽기만. KV write 없음).
+  let roomAll = null;
+  try { roomAll = JSON.parse(await env.HANA_KV.get('synced_bookings') || '{}')[roomName]; } catch (e) {}
+  const roomSegs = ['ab', 'bk', 'tr', 'lv'].flatMap(p => ((roomAll && roomAll[p]) || [])
+    .map(b => [dayMs(b.cinY, b.cinM, b.cinD), dayMs(b.coutY, b.coutM, b.coutD)]))
+    .concat(seenSegs);                                // 이 피드가 실제로 내보내는 조각도 함께 본다
+  let checkoutShown = roomSegs.some(([, z]) => z === todayMs);
+
   const summary = { bk: 'CLOSED - Not available', tr: 'RoomStatus Fully booked' }[key];
   let extra = '', n = 0;
   for (const a of arch) {
     const az = dayMs(a.coutY, a.coutM, a.coutD), as = dayMs(a.cinY, a.cinM, a.cinD);
-    if (az !== todayMs || as >= todayMs || seen.has(as + '_' + az)) continue;
+    if (!shouldRestoreSeg(as, az, roomSegs, todayMs, checkoutShown)) continue;
+    roomSegs.push([as, az]);                          // 되살린 것끼리도 겹치지 않게
+    checkoutShown = true;
     extra += `BEGIN:VEVENT\r\nDTSTART;VALUE=DATE:${fmt(as)}\r\nDTEND;VALUE=DATE:${fmt(az)}\r\n`
            + `UID:hana-restored-${fmt(as)}-${n++}@vagabond1984.workers.dev\r\nSUMMARY:${a.summary || summary}\r\nEND:VEVENT\r\n`;
     changed = true;
