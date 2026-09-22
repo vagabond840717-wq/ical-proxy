@@ -69,6 +69,16 @@ export default {
     if (path === '/ledger/freeze' && request.method === 'POST') {
       return json(await freezeLedger(env), request);
     }
+    // 피드 변화 기록 — 진단용 읽기. ?room= · ?ch= · ?limit= 로 좁힌다. 최신이 앞이다.
+    if (path === '/changes' && request.method === 'GET') {
+      let log = [];
+      try { log = JSON.parse(await env.HANA_KV.get('feed_changes') || '[]'); } catch (e) {}
+      if (!Array.isArray(log)) log = [];
+      const qRoom = url.searchParams.get('room'), qCh = url.searchParams.get('ch');
+      const lim = Math.min(parseInt(url.searchParams.get('limit') || '500', 10) || 500, FEED_LOG_MAX);
+      const rows = log.filter(e => (!qRoom || e.room === qRoom) && (!qCh || e.ch === qCh));
+      return json({ total: log.length, matched: rows.length, changes: rows.slice(0, lim) }, request);
+    }
     if (path === '/push/subscribe' && request.method === 'POST') {
       const sub = await request.json();
       const key = 'sub_' + btoa(sub.endpoint).slice(0, 40).replace(/[+/=]/g, '');
@@ -404,6 +414,10 @@ async function syncAllRooms(env, withPush = false) {
     }
   }
 
+  // 피드 변화 기록 — 저장들보다 먼저 남긴다. 실패해도 동기화 결과는 지킨다.
+  // prevSynced 는 이 함수 첫머리에서 읽은 '직전 피드'다 (아카이브 아님).
+  try { await appendFeedChanges(env, diffFeedShapes(prevSynced, synced_bookings, Date.now())); } catch (e) {}
+
   const newSyncedRaw = JSON.stringify(synced_bookings);
   if (newSyncedRaw !== prevSyncedRaw) await env.HANA_KV.put('synced_bookings', newSyncedRaw);
   const newArchiveRaw = JSON.stringify(mergedArchive);
@@ -431,6 +445,59 @@ async function syncAllRooms(env, withPush = false) {
   }
 
   return { synced: rooms.length, time: new Date().toISOString() };
+}
+
+// ── 피드 변화 기록 (feed_changes) — 2026-09-22 ────────────────────────────
+// 왜: '무엇이 사라졌는지'를 매 5분 계산해놓고 버려 왔다 (syncAllRooms 의 cancelled — 쓰는 데가 없다).
+//     예약에 이름표가 없어 생기는 사고(#29·#31·#32)의 해법은 전부 '언제 무엇이 바뀌었나'인데,
+//     그 기록이 어디에도 안 남는다. 알림 로그(events)로는 대체 불가 — 50개 상한이라 11일치뿐이고,
+//     'not available' 필터 때문에 부킹닷컴은 통째로 빠지며, 사라짐은 아예 안 적는다.
+//     실측(2026-09-22): 603호 9/15 예약이 16:40→9/21, 16:50→9/22, 19:05→9/20 으로 바뀌었는데
+//     이 이력이 남은 곳은 곧 밀려날 알림 로그 하나뿐이었다.
+// ⛔ 사용자 알림(events)에는 넣지 않는다 — 정상 퇴실도 피드에서 사라지므로 전부 '취소'로 오인된다.
+//    여긴 화면에 안 나오는 관측 기록이다. 푸시·배지·달력 영향 0.
+// ⛔ 변화가 있을 때만 KV 에 쓴다 (KV write 한도 원칙). 조용한 tick 은 읽지도 않는다.
+// 재료는 synced_bookings 전후 비교뿐 — 아카이브·원장·경계·내보내기를 건드리지 않는다.
+const FEED_LOG_MAX  = 3000;   // 줄 수 상한
+const FEED_LOG_DAYS = 120;    // 보관 기간
+
+// 동기화 전후의 피드 모양을 견줘 나타남(in)·사라짐(out)을 뽑는다. 네 채널 전부.
+// ⚠ 새 목록에 있는 호실만 본다 — 호실을 지웠을 때 그 방 예약이 통째로 'out' 으로 쏟아지는 걸 막는다.
+// ⚠ 피드 수신이 실패한 채널은 syncAllRooms 가 이전 값을 그대로 물려주므로 여기서 차이가 안 난다
+//    (= 연결 오류를 '사라짐'으로 잘못 적지 않는다).
+function diffFeedShapes(prevSynced, nextSynced, ts) {
+  const out = [];
+  const sig = b => `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`;
+  const ymd = (y, m, d) => `${y}${String(m + 1).padStart(2, '0')}${String(d).padStart(2, '0')}`;
+  const row = (room, ch, kind, b) => ({
+    ts, room, ch, kind,
+    cin:  ymd(b.cinY, b.cinM, b.cinD),
+    cout: ymd(b.coutY, b.coutM, b.coutD),
+    sum:  b.summary || '',
+  });
+  for (const room of Object.keys(nextSynced || {})) {
+    for (const ch of ['ab', 'bk', 'tr', 'lv']) {
+      const before = ((prevSynced || {})[room] || {})[ch] || [];
+      const after  = ((nextSynced || {})[room] || {})[ch] || [];
+      const bSet = new Set(before.map(sig));
+      const aSet = new Set(after.map(sig));
+      for (const b of after)  if (!bSet.has(sig(b))) out.push(row(room, ch, 'in',  b));
+      for (const b of before) if (!aSet.has(sig(b))) out.push(row(room, ch, 'out', b));
+    }
+  }
+  return out;
+}
+
+// 변화를 기록 앞에 얹고 오래된 줄을 덜어낸다. 호출부에서 예외를 삼킨다.
+async function appendFeedChanges(env, changes) {
+  if (!changes.length) return 0;
+  let log = [];
+  try { log = JSON.parse(await env.HANA_KV.get('feed_changes') || '[]'); } catch (e) { log = []; }
+  if (!Array.isArray(log)) log = [];
+  const floor = Date.now() - FEED_LOG_DAYS * 86400000;
+  log = [...changes, ...log].filter(e => e && e.ts >= floor).slice(0, FEED_LOG_MAX);
+  await env.HANA_KV.put('feed_changes', JSON.stringify(log));
+  return changes.length;
 }
 
 async function saveEvent(env, event) {
@@ -900,7 +967,6 @@ async function freezeLedger(env) {
   if (!rooms.length) return { skipped: 'no-rooms' };
   const roomNames = rooms.map(r => r.name);
   const synced = JSON.parse(await env.HANA_KV.get('synced_bookings') || '{}');
-  let archive = {}; try { archive = JSON.parse(await env.HANA_KV.get('booking_archive') || '{}'); } catch (e) {}
   let cuts = [];   try { cuts = JSON.parse(await env.HANA_KV.get('extra_tr_cuts') || '[]'); } catch (e) {}
   if (!Array.isArray(cuts)) cuts = [];
 
@@ -923,7 +989,7 @@ async function freezeLedger(env) {
       const e = (prevMonth[name] || {})[msToYmd(ms - DAY)];
       if (e) prevDay[name] = e;
     }
-    const segs = buildDaySegs(ms, roomNames, synced, archive, cuts, prevDay);
+    const segs = buildDaySegs(ms, roomNames, synced, cuts, prevDay);
     for (const name of roomNames) {
       if (!month[name]) month[name] = {};
       // ⑤ 한 번 굳은 날은 안 바꾼다 — 이미 있으면 건너뛴다 (멱등)
