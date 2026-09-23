@@ -398,18 +398,25 @@ async function syncAllRooms(env, withPush = false) {
         const uid = `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`;
         if (!existingUids.has(uid)) merged.push(b);
       }
-      // 부분 스냅샷 제거: 같은 플랫폼에서 다른 항목 범위 안에 완전히 포함되면 잔재로 판단
-      // (Trip.com은 매일 "오늘~체크아웃" 형태로 시작일이 당겨진 피드를 보내 같은 숙박이 여러 장 쌓임.
-      //  같은 플랫폼에서 실제로 겹치는 예약은 존재할 수 없으므로 포함 관계 = 같은 숙박의 옛 버전)
+      // 앞잘림 잔재 제거 — 트립·부킹이 투숙 중에 시작일을 당겨 보내 같은 숙박이 여러 장 쌓인다.
+      // 지문이 뚜렷하다: **끝날짜는 그대로 두고 시작만 늦어진다.** 딱 그 모양만 지운다.
+      //
+      // ⛔ 옛 규칙("더 넓은 것 안에 완전히 포함되면 지움")으로 되돌리지 말 것 — 진짜 예약을 지운다.
+      //    2026-09-23 실측, 진짜 예약 18건이 저장되자마자 지워지고 있었다:
+      //    · 601호 — 부킹 7개월짜리 '안 파는 기간'(7/2~2/1) 하나가 그 안의 진짜 예약 9건을 삼킴
+      //    · 603호 — ab 10/02~10/13(진짜)이 10/02~10/17(옛 모양) 안에 들어 삭제 → 10/17 유령 예정
+      //    · 손님이 예약을 줄이면 진짜가 짧은 쪽이 되어 **매번 진짜가 진다** (#32 의 뿌리)
+      //    좁힌 규칙으로 18건 전부 살아나고 앞잘림은 그대로 잡힌다 (실데이터 전수 대조 완료).
+      // ⛔ ab 는 앞을 자르지 않는다 → 아예 적용하지 않는다 (UNTRIM_PLATFORMS 와 같은 근거)
+      // ⚠ 같은 규칙이 예약앱 mergeArchiveIntoRooms 에도 복제돼 있다 — 함께 고쳐야 한다 (#2)
       const dn = (y, m, d) => new Date(y, m, d).getTime();
+      const trims = UNTRIM_PLATFORMS.includes(key);
       mergedArchive[room.name][key] = merged.filter(b => {
         if (new Date(b.coutY, b.coutM, b.coutD) < cutoff) return false;
+        if (!trims) return true;
         const bs = dn(b.cinY, b.cinM, b.cinD), be = dn(b.coutY, b.coutM, b.coutD);
-        return !merged.some(o => {
-          if (o === b) return false;
-          const os = dn(o.cinY, o.cinM, o.cinD), oe = dn(o.coutY, o.coutM, o.coutD);
-          return os <= bs && oe >= be && (os < bs || oe > be);
-        });
+        return !merged.some(o => o !== b
+          && dn(o.coutY, o.coutM, o.coutD) === be && dn(o.cinY, o.cinM, o.cinD) < bs);
       });
     }
   }
@@ -726,6 +733,57 @@ async function readDaylock(env) {
 // 상세: docs/features/untrim.md
 const UNTRIM_PLATFORMS = ['bk', 'tr'];   // 앞잘림이 실측된 채널만. ab 는 안 자른다
 
+// ── 입실일 되살리기 재료: 어제 원장 (2026-09-23) ──────────────────────────
+// 왜 수첩이 아니라 원장인가 — 실측:
+//   수첩은 '끝날짜가 같은 줄'로 짝을 찾는다 → 투숙 중 연장·단축하면 짝이 사라진다.
+//     · 연장 9/23→9/25 : 입실일이 2일 밀려 나옴
+//     · 단축 9/25→9/24 : 복원 자체가 안 돼 **오늘 체크인**으로 보임 (3일째 손님인데)
+//   원장은 '어제 이 방에 있던 손님'으로 찾는다 → 퇴실일이 어떻게 바뀌든 연결이 안 끊긴다.
+// 원장에 어제 칸이 없으면 지금까지처럼 수첩(untrimSegs)으로 넘어간다 → 나빠지는 경우가 없다.
+// ⛔ 내보내기(exportIcal)는 건드리지 않는다. 앞잘림은 지난 밤만 깎는데 지난 밤은 팔 수 없다 → 오버부킹 무관.
+async function readPrevDayLedger(env, todayMs) {
+  const prevMs = todayMs - DAY;
+  const mk = msToMonthKey(prevMs), dayStr = msToYmd(prevMs);
+  let month;
+  try { month = JSON.parse(await env.HANA_KV.get('ledger_' + mk) || '{}'); } catch (e) { return {}; }
+  const out = {};
+  for (const [room, days] of Object.entries(month || {})) {
+    const e = days && days[dayStr];
+    if (e) out[room] = e;
+  }
+  return out;
+}
+
+// 어제 원장 조각 중 '어젯밤을 덮고 오늘 이후까지 이어지는' 것의 입실일. 없으면 null.
+// ⚠ buildDaySegs 의 입실일 상속과 **같은 규칙**이다. 판정은 이 함수 한 곳에만 둔다 (#2).
+// ⛔ 피드의 퇴실일과 비교하지 않는다 — 투숙 중 연장·단축에 연결이 끊기면 안 된다.
+// ⛔ 어제 원장의 퇴실일이 '오늘'이면 잇지 않는다. '같은 손님의 당일 연장'과 '한 팀 나가고
+//    새 팀 입실'은 날짜만으로 구분되지 않는다(실측 확인 — 두 경우의 입력이 완전히 같다).
+//    잘못 이으면 그날 교대 청소가 일정에서 사라지므로 끊어 보는 쪽이 안전하다.
+//    당일 연장은 수동 블락으로 잡는다 (사용자 결정 2026-09-23).
+function ledgerCin(prevSegs, cinStr, todayStr, prevStr) {
+  const p = (prevSegs || []).find(x =>
+    x.cin <= prevStr && prevStr < x.cout && x.cout > todayStr && x.cin < cinStr);
+  return p ? p.cin : null;
+}
+
+// 피드 조각들의 잘린 시작일을 어제 원장으로 되돌린다. 안 바뀌면 원본 배열 그대로.
+function untrimByLedger(feed, prevSegs, todayMs) {
+  if (!prevSegs || !prevSegs.length) return feed;
+  const yesterdayMs = todayMs - DAY;
+  const todayStr = msToYmd(todayMs), prevStr = msToYmd(yesterdayMs);
+  let changed = false;
+  const out = (feed || []).map(b => {
+    const bs = dayMs(b.cinY, b.cinM, b.cinD);
+    if (bs !== todayMs && bs !== yesterdayMs) return b;          // 잘림 자국이 아니다
+    const cin = ledgerCin(prevSegs, ymdStr(b.cinY, b.cinM, b.cinD), todayStr, prevStr);
+    if (!cin) return b;
+    changed = true;
+    return { ...b, cinY: +cin.slice(0, 4), cinM: +cin.slice(4, 6) - 1, cinD: +cin.slice(6, 8) };
+  });
+  return changed ? out : feed;
+}
+
 function untrimSegs(feed, arch, todayMs) {
   const yesterdayMs = todayMs - 86400000;
   let changed = false;
@@ -804,6 +862,7 @@ async function applyUntrim(env, rooms) {
   try { arch = JSON.parse(await env.HANA_KV.get('booking_archive') || '{}'); } catch (e) { return rooms; }
   const t = todayKST();
   const todayMs = dayMs(t.y, t.m, t.d);
+  const prevLedger = await readPrevDayLedger(env, todayMs);
   const out = {};
   for (const [room, data] of Object.entries(rooms || {})) {
     const archR = arch[room] || {};
@@ -812,7 +871,10 @@ async function applyUntrim(env, rooms) {
     const fixed = {};
     for (const k of ['ab', 'bk', 'tr', 'lv']) {
       const feed = (data && data[k]) || [];
-      fixed[k] = UNTRIM_PLATFORMS.includes(k) ? untrimSegs(feed, archR[k], todayMs) : feed;
+      // 입실일 되살리기 — ① 어제 원장 먼저, ② 원장에 없으면 수첩 (지금까지의 동작)
+      fixed[k] = UNTRIM_PLATFORMS.includes(k)
+        ? untrimSegs(untrimByLedger(feed, ((prevLedger[room] || {})[k]) || [], todayMs), archR[k], todayMs)
+        : feed;
     }
     // ② 오늘 퇴실 되살리기 — 판단 재료는 그 방 네 채널 전부다 (한 방에 한 팀)
     const roomSegs = ['ab', 'bk', 'tr', 'lv'].flatMap(k =>
@@ -1093,7 +1155,9 @@ async function fixIcalText(env, text, roomName, key) {
   try { arch = ((JSON.parse(await env.HANA_KV.get('booking_archive') || '{}')[roomName] || {})[key]) || []; } catch (e) {}
   const t = todayKST();
   const todayMs = dayMs(t.y, t.m, t.d), yesterdayMs = todayMs - 86400000;
-  if (nightMs === null && !arch.length) return text;
+  let prevSegs = [];
+  try { prevSegs = ((await readPrevDayLedger(env, todayMs))[roomName] || {})[key] || []; } catch (e) {}
+  if (nightMs === null && !arch.length && !prevSegs.length) return text;
 
   const fmt = ms => { const d = new Date(ms); return ymdStr(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
   const setDates = (blk, a, z) => blk
@@ -1120,9 +1184,11 @@ async function fixIcalText(env, text, roomName, key) {
       if (nightMs + 86400000 < e) segs.push([nightMs + 86400000, e]);
       changed = true;
     }
-    // ② 남은 조각의 시작이 오늘·어제면 아카이브에서 더 이른 시작을 찾아 되돌린다
+    // ② 남은 조각의 시작이 오늘·어제면 되돌린다 — 어제 원장 먼저, 없으면 수첩 (예약앱 경로와 같은 순서)
     segs = segs.map(([a, z]) => {
       if (a !== todayMs && a !== yesterdayMs) return [a, z];
+      const lc = ledgerCin(prevSegs, fmt(a), fmt(todayMs), fmt(yesterdayMs));
+      if (lc) { changed = true; return [ymdMs(lc), z]; }
       let best = null;
       for (const x of arch) {
         if (dayMs(x.coutY, x.coutM, x.coutD) !== z) continue;
