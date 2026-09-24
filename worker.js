@@ -79,6 +79,14 @@ export default {
       const rows = log.filter(e => (!qRoom || e.room === qRoom) && (!qCh || e.ch === qCh));
       return json({ total: log.length, matched: rows.length, changes: rows.slice(0, lim) }, request);
     }
+    // 메모 목록 — 진단용 읽기
+    if (path === '/memo' && request.method === 'GET') {
+      return json(await readMemoIndex(env) || [], request);
+    }
+    // 메모 1회 이관. ?dry=1 이면 무엇을 바꿀지 보여주기만 하고 쓰지 않는다
+    if (path === '/memo/migrate' && request.method === 'POST') {
+      return json(await migrateMemos(env, url.searchParams.get('dry') === '1'), request);
+    }
     if (path === '/push/subscribe' && request.method === 'POST') {
       const sub = await request.json();
       const key = 'sub_' + btoa(sub.endpoint).slice(0, 40).replace(/[+/=]/g, '');
@@ -170,6 +178,8 @@ export default {
       // 원장 굳히기는 동기화 성공 후에만. 실패하면 피드가 낡은 상태라 굳히면 안 된다.
       // 여기서 던지면 sync 결과까지 오류로 묻히므로 삼킨다 — 5분 뒤 다음 tick 이 이어받는다.
       try { await freezeLedger(env); } catch (e) {}
+      // 메모 관리 (에어비앤비 날짜 이동 · 30일 정리). 실패해도 다음 tick 이 이어받는다
+      try { await upkeepMemos(env); } catch (e) {}
     })());
   }
 };
@@ -328,7 +338,8 @@ async function syncAllRooms(env, withPush = false) {
           const uid = `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`;
           const cin  = `${b.cinY}/${String(b.cinM+1).padStart(2,'0')}/${String(b.cinD).padStart(2,'0')}`;
           const cout = `${b.coutY}/${String(b.coutM+1).padStart(2,'0')}/${String(b.coutD).padStart(2,'0')}`;
-          bookingMap[uid] = { ...b, cin, cout };
+          const { uid: _u, ...plain } = b;   // 예약 번호는 알림 기억표에 넣지 않는다
+          bookingMap[uid] = { ...plain, cin, cout };
         });
         const uids = Object.keys(bookingMap);
         const prevData = prev[room.name + '_' + p.key] || {};
@@ -396,7 +407,7 @@ async function syncAllRooms(env, withPush = false) {
       const merged = [...existing];
       for (const b of incoming) {
         const uid = `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`;
-        if (!existingUids.has(uid)) merged.push(b);
+        if (!existingUids.has(uid)) { const { uid: _u, ...plain } = b; merged.push(plain); }   // 아카이브 모양 불변
       }
       // 앞잘림 잔재 제거 — 트립·부킹이 투숙 중에 시작일을 당겨 보내 같은 숙박이 여러 장 쌓인다.
       // 지문이 뚜렷하다: **끝날짜는 그대로 두고 시작만 늦어진다.** 딱 그 모양만 지운다.
@@ -481,6 +492,7 @@ function diffFeedShapes(prevSynced, nextSynced, ts) {
     cin:  ymd(b.cinY, b.cinM, b.cinD),
     cout: ymd(b.coutY, b.coutM, b.coutD),
     sum:  b.summary || '',
+    ...(b.uid ? { uid: b.uid } : {}),   // 에어비앤비 예약 번호 — 날짜 변경 때 같은 번호인지 확인용
   });
   for (const room of Object.keys(nextSynced || {})) {
     for (const ch of ['ab', 'bk', 'tr', 'lv']) {
@@ -566,7 +578,14 @@ function parseIcal(text, platform) {
     const oneYearAgo = new Date(); oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1); oneYearAgo.setHours(0,0,0,0);
     const coutDate = new Date(cout.y, cout.m, cout.d);
     if (coutDate < oneYearAgo) continue;
-    bookings.push({ cinY: cin.y, cinM: cin.m, cinD: cin.d, coutY: cout.y, coutM: cout.m, coutD: cout.d, platform, summary });
+    const bk = { cinY: cin.y, cinM: cin.m, cinD: cin.d, coutY: cout.y, coutM: cout.m, coutD: cout.d, platform, summary };
+    // 에어비앤비만 예약 번호를 싣는다 — 메모가 날짜 변경을 따라가는 데 쓴다 (memo-indicator).
+    // ⛔ 부킹은 UID 를 매일 새로 발급한다는 보고가 있다 → 실으면 매일 KV 쓰기. 싣지 않는다
+    if (platform === 'airbnb') {
+      const uid = (block.replace(/\r?\n[ \t]/g, '').match(/UID:([^\r\n]+)/) || [])[1]?.trim();
+      if (uid) bk.uid = uid;
+    }
+    bookings.push(bk);
   }
   return bookings;
 }
@@ -1319,6 +1338,241 @@ async function exportIcal(env, roomName, target = null) {
 function emptyIcal(n) {
   return `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//HANA STAY//KO\r\nCALSCALE:GREGORIAN\r\nX-WR-CALNAME:${n} 예약현황\r\nEND:VCALENDAR\r\n`;
 }
+// ══════════════════════════════════════════════════════════════════════════
+// 예약 메모 (memo-indicator, 2026-09-24)
+// ══════════════════════════════════════════════════════════════════════════
+// 서랍  extra_<호실>|<입실일>[_bk|_tr|_lv|_bl]   {passwords, memos}  — 두 앱이 같이 본다 (그대로)
+// 목록  extra_memo_index  [{key, room, ch, cin, cout, uid?}]         — 메모가 있는 서랍만 한 줄
+//   · 예약앱 달력 📝 는 이 목록 하나만 읽는다. 두 앱은 메모를 쓰고 지울 때 saveListMerged 로 고친다
+//   · 판정(에어비앤비 날짜 이동·30일 정리)은 여기 한 곳에만 둔다 (#2)
+// ⛔ 메모를 자동으로 지우는 길은 30일 정리 하나뿐. 예약이 피드에서 사라진 것만으로는 지우지 않는다 (#27)
+// ⛔ 목록을 못 읽으면(null) 쓰지 않는다 — '못 읽음'을 '비어 있음'으로 보지 말 것 (#22·#26)
+// 상세: docs/features/memo-indicator.md
+const MEMO_INDEX_KEY   = 'extra_memo_index';
+const MEMO_KEEP_DAYS   = 30;   // 퇴실 뒤 보관 일수
+const MEMO_NOCOUT_DAYS = 90;   // 퇴실일을 모르는 옛 메모 — 입실 뒤 보관 일수
+const MEMO_DRAWER_RE   = /^(.+)\|(\d{8})(?:_(bk|tr|lv|bl))?$/;
+
+async function readMemoIndex(env) {
+  const raw = await env.HANA_KV.get(MEMO_INDEX_KEY);
+  if (raw === null) return [];
+  try { const d = JSON.parse(raw); return Array.isArray(d) ? d : null; } catch (e) { return null; }
+}
+
+async function readDrawer(env, key) {
+  const raw = await env.HANA_KV.get('extra_' + key);
+  if (raw === null) return { passwords: [], memos: [] };
+  const d = JSON.parse(raw);   // 깨진 서랍이면 던진다 → 호출부가 그 줄을 건너뛴다
+  return { ...d, passwords: d.passwords || [], memos: d.memos || [] };
+}
+async function writeDrawer(env, key, d) {
+  if (!d.memos.length && !d.passwords.length) await env.HANA_KV.delete('extra_' + key);
+  else await env.HANA_KV.put('extra_' + key, JSON.stringify(d));
+}
+// 메모·비밀번호는 최신이 앞. 날짜 문자열 "YYYY.MM.DD HH:MM" 은 글자순 = 시간순
+const byDateDesc = (a, b) => String(b.date || '').slice(0, 16).localeCompare(String(a.date || '').slice(0, 16));
+function mergeList(a, b, max) {
+  const seen = new Set(), out = [];
+  for (const x of [...a, ...b].sort(byDateDesc)) {
+    const k = JSON.stringify(x);
+    if (!seen.has(k)) { seen.add(k); out.push(x); }
+  }
+  return max ? out.slice(0, max) : out;
+}
+
+// 서랍 A 의 메모를 B 로 옮긴다. 도착지를 먼저 쓴다 → 중간에 끊겨도 메모는 잃지 않는다
+async function moveMemos(env, fromKey, toKey) {
+  const from = await readDrawer(env, fromKey);
+  if (!from.memos.length) return;
+  const to = await readDrawer(env, toKey);
+  to.memos = mergeList(to.memos, from.memos);
+  await writeDrawer(env, toKey, to);
+  from.memos = [];
+  await writeDrawer(env, fromKey, from);
+}
+
+const bkCin  = b => ymdStr(b.cinY, b.cinM, b.cinD);
+const bkCout = b => ymdStr(b.coutY, b.coutM, b.coutD);
+const addDays = (s, n) => { const d = new Date(ymdMs(s) + n * DAY); return ymdStr(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
+// 블락은 끝날 포함 → 퇴실일 = 끝날 다음날
+const blockCout = b => addDays(ymdStr(b.endY, b.endM, b.endD), 1);
+
+// 5분 동기화 끝에 호출. 바뀐 게 있을 때만 쓴다 (KV 한도 원칙)
+async function upkeepMemos(env) {
+  const idx = await readMemoIndex(env);
+  if (!idx || !idx.length) return { skipped: true };
+  const origKeys = new Set(idx.map(r => r.key));   // 아래에서 줄을 고치기 전의 서랍 이름
+  const synced = JSON.parse(await env.HANA_KV.get('synced_bookings') || '{}');
+  let blocks = null;
+  if (idx.some(r => r.ch === 'bl')) {
+    try { blocks = JSON.parse(await env.HANA_KV.get('extra_manual_blocks') || '[]'); } catch (e) {}
+  }
+  let changed = false;
+  const log = [];
+
+  // ① 지금 피드와 맞춰 본다 — 퇴실일 갱신, 에어비앤비 날짜 이동
+  for (const row of idx) {
+    try {
+      if (row.ch === 'bl') {
+        const bl = Array.isArray(blocks) && blocks.find(b => b.roomName === row.room && ymdStr(b.startY, b.startM, b.startD) === row.cin);
+        if (bl && blockCout(bl) !== row.cout) { row.cout = blockCout(bl); changed = true; }
+        continue;
+      }
+      const feed = ((synced[row.room] || {})[row.ch]) || [];
+      let bk = row.ch === 'ab' && row.uid ? feed.find(b => b.uid === row.uid) : null;
+      if (!bk) bk = feed.find(b => bkCin(b) === row.cin);
+      if (!bk) continue;   // 피드에 없다 → 그대로 둔다 (📝 만 안 뜬다)
+      if (row.ch === 'ab' && bk.uid && !row.uid) { row.uid = bk.uid; changed = true; }
+      if (bkCout(bk) !== row.cout) { row.cout = bkCout(bk); changed = true; }
+      const nc = bkCin(bk);
+      if (nc !== row.cin) {   // 같은 예약 번호가 다른 입실일로 나타났다 = 손님이 날짜를 바꿨다
+        const toKey = `${row.room}|${nc}`;
+        await moveMemos(env, row.key, toKey);
+        log.push({ moved: row.key, to: toKey });
+        row.key = toKey; row.cin = nc; changed = true;
+      }
+    } catch (e) {}
+  }
+  // 같은 서랍을 가리키는 줄이 둘이면 하나로
+  const byKey = new Map();
+  for (const r of idx) { if (byKey.has(r.key)) changed = true; byKey.set(r.key, { ...byKey.get(r.key), ...r }); }
+  let rows = [...byKey.values()];
+
+  // ② 30일 정리 — 하루 1회
+  const t = todayKST(), today = ymdStr(t.y, t.m, t.d);
+  if (await env.HANA_KV.get('memo_cleanup_day') !== today) {
+    const keep = [];
+    for (const r of rows) {
+      const until = r.cout ? addDays(r.cout, MEMO_KEEP_DAYS) : addDays(r.cin, MEMO_NOCOUT_DAYS);
+      if (until >= today) { keep.push(r); continue; }
+      try {
+        const d = await readDrawer(env, r.key);
+        if (d.memos.length) { d.memos = []; await writeDrawer(env, r.key, d); }   // 비밀번호는 남긴다
+        log.push({ cleaned: r.key });
+        changed = true;
+      } catch (e) { keep.push(r); }
+    }
+    rows = keep;
+    await env.HANA_KV.put('memo_cleanup_day', today);
+  }
+
+  if (changed) {
+    // 앱이 그 사이 줄을 더했을 수 있다 → 쓰기 직전에 다시 읽어 내가 모르는 줄은 살린다
+    const latest = await readMemoIndex(env);
+    if (!latest) return { skipped: true, log };
+    const known = new Set(rows.map(r => r.key));
+    for (const r of latest) if (!origKeys.has(r.key) && !known.has(r.key)) rows.push(r);
+    await env.HANA_KV.put(MEMO_INDEX_KEY, JSON.stringify(rows));
+  }
+  return { changed, log };
+}
+
+// 1회 이관 — 기존 서랍을 훑어 ① 목록 등록 ② 예약앱이 꼬리표 없이 써둔 부킹·트립·리브·블락 서랍을
+// 꼬리표 서랍으로 합친다 ③ 옛 메모 줄에 채널·날짜 머리표를 채운다. 실행 전 원본을 통째로 백업한다.
+// 판단이 안 서는 서랍은 손대지 않고 unresolved 로 보고만 한다.
+async function migrateMemos(env, dry) {
+  const synced  = JSON.parse(await env.HANA_KV.get('synced_bookings') || '{}');
+  const archive = JSON.parse(await env.HANA_KV.get('booking_archive') || '{}');
+  let blocks = [];
+  try { blocks = JSON.parse(await env.HANA_KV.get('extra_manual_blocks') || '[]'); } catch (e) {}
+  const idx = await readMemoIndex(env);
+  if (!idx) return { error: '메모 목록을 읽지 못했어요 — 아무것도 바꾸지 않았어요' };
+
+  const names = [];
+  let cursor;
+  do {
+    const page = await env.HANA_KV.list({ prefix: 'extra_', cursor });
+    for (const k of page.keys) names.push(k.name);
+    cursor = page.list_complete ? null : page.cursor;
+  } while (cursor);
+
+  // 그 방·그 입실일에 예약이 있는 채널들 (피드 먼저, 없으면 아카이브). 퇴실일은 피드 우선, 아카이브는 가장 늦은 것
+  function lookup(room, cin) {
+    const found = {};
+    for (const ch of ['ab', 'bk', 'tr', 'lv']) {
+      const f = (((synced[room] || {})[ch]) || []).find(b => bkCin(b) === cin);
+      if (f) { found[ch] = { cout: bkCout(f), uid: f.uid }; continue; }
+      const a = (((archive[room] || {})[ch]) || []).filter(b => bkCin(b) === cin).map(bkCout).sort();
+      if (a.length) found[ch] = { cout: a[a.length - 1] };
+    }
+    const bl = Array.isArray(blocks) && blocks.find(b => b.roomName === room && ymdStr(b.startY, b.startM, b.startD) === cin);
+    if (bl) found.bl = { cout: blockCout(bl) };
+    return found;
+  }
+
+  const report = { dry, scanned: 0, indexed: [], moved: [], filled: 0, unresolved: [] };
+  // 1단계: 서랍을 전부 읽어 둔다 (이후 작업은 이 사본 위에서 — 같은 서랍을 두 번 쓰다 덮어쓰는 일 방지)
+  const raws = new Map(), drawers = new Map();
+  for (const name of names) {
+    const key = name.slice('extra_'.length);
+    if (!MEMO_DRAWER_RE.test(key)) continue;
+    report.scanned++;
+    const raw = await env.HANA_KV.get(name);
+    try {
+      const d = JSON.parse(raw);
+      raws.set(key, raw);
+      drawers.set(key, { ...d, passwords: d.passwords || [], memos: d.memos || [] });
+    } catch (e) { report.unresolved.push({ key, why: '깨진 서랍' }); }
+  }
+  const dirty = new Set(), gone = new Set(), chOf = new Map();
+
+  // 2단계: 꼬리표 없는 서랍의 채널을 정한다. 에어비앤비 예약이 있으면 에어비앤비(그대로),
+  //        다른 채널 하나뿐이면 그 꼬리표 서랍으로 합친다. 그 밖엔 손대지 않는다.
+  for (const key of [...drawers.keys()]) {
+    const [, room, cin, suffix] = key.match(MEMO_DRAWER_RE);
+    if (suffix) { chOf.set(key, suffix); continue; }
+    const d = drawers.get(key);
+    if (!d.memos.length && !d.passwords.length) continue;
+    const found = lookup(room, cin), chs = Object.keys(found);
+    if (found.ab) { chOf.set(key, 'ab'); continue; }
+    if (chs.length !== 1) {
+      report.unresolved.push({ key, why: chs.length ? `채널 여러 개: ${chs.join(',')}` : '맞는 예약 없음', memos: d.memos.length, passwords: d.passwords.length });
+      continue;
+    }
+    const ch = chs[0], target = `${key}_${ch}`;
+    const to = drawers.get(target) || { passwords: [], memos: [] };
+    drawers.set(target, { ...to, passwords: mergeList(to.passwords, d.passwords, 15), memos: mergeList(to.memos, d.memos) });
+    drawers.delete(key);
+    chOf.set(target, ch);
+    dirty.add(target); gone.add(key);
+    report.moved.push({ from: key, to: target, memos: d.memos.length, passwords: d.passwords.length });
+  }
+
+  // 3단계: 옛 메모 줄에 머리표(채널·예약 날짜)를 채우고 목록에 올린다
+  const rows = new Map(idx.filter(r => !gone.has(r.key)).map(r => [r.key, r]));
+  for (const [key, d] of drawers) {
+    const ch = chOf.get(key);
+    if (!ch) continue;
+    const [, room, cin] = key.match(MEMO_DRAWER_RE);
+    const info = lookup(room, cin)[ch] || {};
+    let filled = 0;
+    d.memos = d.memos.map(x => {
+      if (x.ch && x.cin) return x;
+      filled++;
+      return { ...x, ch, cin, cout: x.cout || info.cout || '' };
+    });
+    if (filled) { dirty.add(key); report.filled += filled; }
+    if (d.memos.length) {
+      const old = rows.get(key) || {};
+      rows.set(key, { ...old, key, room, ch, cin, cout: info.cout || old.cout || '', ...(info.uid ? { uid: info.uid } : {}) });
+    } else rows.delete(key);
+  }
+  const writes = [...dirty].filter(k => !gone.has(k)).map(k => [k, drawers.get(k)]);
+  for (const k of gone) writes.push([k, null]);
+  const backup = {};
+  for (const [k] of writes) if (raws.has(k)) backup[k] = raws.get(k);
+  report.indexed = [...rows.values()];
+  if (dry) return report;
+
+  if (Object.keys(backup).length) await env.HANA_KV.put('memo_backup_' + Date.now(), JSON.stringify(backup));
+  for (const [k, v] of writes) {
+    if (v === null) await env.HANA_KV.delete('extra_' + k);
+    else await env.HANA_KV.put('extra_' + k, JSON.stringify(v));
+  }
+  await env.HANA_KV.put(MEMO_INDEX_KEY, JSON.stringify(report.indexed));
+  return report;
+}
+
 function json(data, request, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', ...cors(request) } });
 }
