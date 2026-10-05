@@ -901,8 +901,12 @@ async function applyUntrim(env, rooms) {
     let checkoutShown = roomSegs.some(([, e]) => e === todayMs);
     // 순서는 ab → bk → tr → lv 그대로. 에어비앤비만 '예약'(Reserved)을 보내고
     // 나머지는 '재고 차단'이므로, 되살릴 자격은 에어비앤비가 먼저 갖는 게 맞다.
+    // ⛔ 에어비앤비는 되살리지 않는다 (2026-10-04). 끝난 예약을 퇴실 이틀 뒤 09:00 에야 뺀다
+    //    (feed_changes 실측 9건 전부) → 오늘 퇴실은 늘 피드에 있다. 피드에 없는데 수첩에만 있는
+    //    에어비앤비 '오늘 퇴실'은 전부 유령이다 — 501호 9/28~10/2 (10/2), 401호 9/3~9/18 (#31).
     let next = data;
     for (const k of ['ab', 'bk', 'tr', 'lv']) {
+      if (k === 'ab') continue;
       const feed = (data && data[k]) || [];
       const restored = restoreTodayCheckouts(fixed[k], archR[k], todayMs, roomSegs, checkoutShown);
       if (restored !== fixed[k]) { fixed[k] = restored; checkoutShown = true; }
