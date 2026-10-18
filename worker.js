@@ -168,6 +168,8 @@ export default {
       if (fixHost && hostname.endsWith(fixHost)) {
         try { text = await fixIcalText(env, text, url.searchParams.get('room'), fix); } catch (e) {}
       }
+      // fix=ab — 청소앱 전용. 오늘 입실·퇴실하는 손님 것만 남기고 설명 줄(전화 끝 4자리)을 지운다
+      if (fix === 'ab' && /(^|\.)airbnb\.(com|co\.kr)$/.test(hostname)) text = maskAbPhones(text);
       return new Response(text, { headers: { 'Content-Type': 'text/calendar', ...cors(request) } });
     } catch (e) { return json({ error: e.message }, request, 500); }
   },
@@ -338,7 +340,7 @@ async function syncAllRooms(env, withPush = false) {
           const uid = `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`;
           const cin  = `${b.cinY}/${String(b.cinM+1).padStart(2,'0')}/${String(b.cinD).padStart(2,'0')}`;
           const cout = `${b.coutY}/${String(b.coutM+1).padStart(2,'0')}/${String(b.coutD).padStart(2,'0')}`;
-          const { uid: _u, ...plain } = b;   // 예약 번호는 알림 기억표에 넣지 않는다
+          const { uid: _u, ph: _p, ...plain } = b;   // 예약 번호·전화 끝자리는 알림 기억표에 넣지 않는다
           bookingMap[uid] = { ...plain, cin, cout };
         });
         const uids = Object.keys(bookingMap);
@@ -407,7 +409,7 @@ async function syncAllRooms(env, withPush = false) {
       const merged = [...existing];
       for (const b of incoming) {
         const uid = `${b.cinY}_${b.cinM}_${b.cinD}_${b.coutY}_${b.coutM}_${b.coutD}`;
-        if (!existingUids.has(uid)) { const { uid: _u, ...plain } = b; merged.push(plain); }   // 아카이브 모양 불변
+        if (!existingUids.has(uid)) { const { uid: _u, ph: _p, ...plain } = b; merged.push(plain); }   // 아카이브 모양 불변 (번호·끝자리 안 넣음)
       }
       // 앞잘림 잔재 제거 — 트립·부킹이 투숙 중에 시작일을 당겨 보내 같은 숙박이 여러 장 쌓인다.
       // 지문이 뚜렷하다: **끝날짜는 그대로 두고 시작만 늦어진다.** 딱 그 모양만 지운다.
@@ -553,6 +555,28 @@ async function fetchAndParseIcal(url, platform) {
   } catch { return null; }
 }
 
+// 청소앱용 에어비앤비 피드 (airbnb-auto-pw, 2026-10-18)
+// 비밀번호는 호스트와 손님만 안다 — 청소 인력에게는 **체크인·체크아웃 당일**분만 보낸다.
+// 오늘(KST)이 입실일도 퇴실일도 아닌 예약은 DESCRIPTION 줄을 통째로 지운다.
+//   전화 줄만 골라 지우지 않는 이유: 에어비앤비가 문구를 바꾸면 번호가 그대로 새어 나간다.
+//   청소앱은 DESCRIPTION 을 달력에 쓰지 않는다 (SUMMARY·DTSTART·DTEND 만) → 표시 무영향
+// ⛔ 실패하면 설명 줄을 **전부** 지운 판을 준다. 원본으로 물러서지 않는다
+// ⛔ fix 없는 /?url= 는 원본 그대로 — 진단(원본 대조)용
+function maskAbPhones(text) {
+  const flat = text.replace(/\r?\n[ \t]/g, '');
+  try {
+    const t = todayKST(), today = ymdStr(t.y, t.m, t.d);
+    return flat.replace(/BEGIN:VEVENT[\s\S]*?END:VEVENT/g, ev => {
+      const s = (ev.match(/DTSTART(?:;[^:]*)?:(\d{8})/) || [])[1];
+      const e = (ev.match(/DTEND(?:;[^:]*)?:(\d{8})/)   || [])[1];
+      if (s === today || e === today) return ev;
+      return ev.replace(/^DESCRIPTION[;:][^\r\n]*\r?\n/m, '');
+    });
+  } catch (e) {
+    return flat.replace(/^DESCRIPTION[;:][^\r\n]*\r?\n/gm, '');
+  }
+}
+
 function parseIcal(text, platform) {
   const bookings = [];
   const events = text.split('BEGIN:VEVENT');
@@ -582,8 +606,13 @@ function parseIcal(text, platform) {
     // 에어비앤비만 예약 번호를 싣는다 — 메모가 날짜 변경을 따라가는 데 쓴다 (memo-indicator).
     // ⛔ 부킹은 UID 를 매일 새로 발급한다는 보고가 있다 → 실으면 매일 KV 쓰기. 싣지 않는다
     if (platform === 'airbnb') {
-      const uid = (block.replace(/\r?\n[ \t]/g, '').match(/UID:([^\r\n]+)/) || [])[1]?.trim();
+      const flat = block.replace(/\r?\n[ \t]/g, '');
+      const uid = (flat.match(/UID:([^\r\n]+)/) || [])[1]?.trim();
       if (uid) bk.uid = uid;
+      // 손님 전화 끝 4자리 = 도어락 비밀번호 (airbnb-auto-pw). 예약앱이 손 입력이 없을 때 보여준다.
+      // ⛔ 아카이브·알림 기억표에는 넣지 않는다 (uid 와 같이 뺀다). 숫자 4개가 아니면 싣지 않는다
+      const ph = summary === 'Reserved' && (flat.match(/Phone Number \(Last 4 Digits\):\s*(\d{4})(?!\d)/) || [])[1];
+      if (ph) bk.ph = ph;
     }
     bookings.push(bk);
   }
