@@ -1752,7 +1752,7 @@ async function logAccess(env, row) {
   const now = Date.now();
   row = { ts: now, ...row };
   if (row.act === 'view' && log.some(e => e.act === 'view' && e.id === row.id && e.key === row.key && now - e.ts < ACCESS_VIEW_MERGE)) return;
-  if (row.act === 'deny' && log.some(e => e.act === 'deny' && e.id === row.id && kstDay(e.ts) === kstDay(now))) return;
+  if (row.act === 'deny' && log.some(e => e.act === 'deny' && e.id === row.id && e.state === row.state && kstDay(e.ts) === kstDay(now))) return;
   const cut = now - ACCESS_LOG_DAYS * DAY;
   log = [row, ...log.filter(e => e.ts >= cut)].slice(0, ACCESS_LOG_MAX);
   await env.HANA_KV.put(ACCESS_LOG_KEY, JSON.stringify(log));
