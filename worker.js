@@ -13,25 +13,47 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // 청소 전용 링크 (cleaner-link) — 비밀번호·원주소가 나가는 길만 누구인지 본다
+    let who = null, mode = 'full';
+    if (['/rooms', '/extra', '/bookings', '/feed'].includes(path) || path.startsWith('/access/')) {
+      who = await whoIs(env, request);
+      if (path.startsWith('/access/')) return await handleAccess(env, request, url, path, who);
+      mode = await accessMode(env, who);
+      if (mode === 'deny') { await logDeny(env, who); return denyResp(request, who); }
+    }
+
     if (path === '/rooms' && request.method === 'POST') {
+      if (mode !== 'full') return json({ error: '호실 관리는 예약앱에서만' }, request, 403);   // 원주소 빈칸으로 덮어쓰기 방지
       await env.HANA_KV.put('rooms', JSON.stringify(await request.json()));
       return json({ ok: true }, request);
     }
     if (path === '/rooms' && request.method === 'GET') {
       const data = await env.HANA_KV.get('rooms');
+      if (mode !== 'full') {   // 청소 열쇠 — 원주소는 빼고 '있다'는 표시만 (피드는 /feed 로 받는다)
+        let rooms = [];
+        try { rooms = JSON.parse(data || '[]'); } catch (e) {}
+        return json(rooms.map(r => ({ ...r, ...Object.fromEntries(Object.values(FEED_FIELD).map(f => [f, r[f] ? 'hidden' : ''])) })), request);
+      }
       return new Response(data || '[]', { headers: { 'Content-Type': 'application/json', ...cors(request) } });
     }
     if (path === '/extra' && request.method === 'POST') {
       const body = await request.json();
       if (!body.key) return json({ error: 'key 없음' }, request, 400);
+      if (mode !== 'full') { await extraPost(env, body.key, body.data, mode, who); return json({ ok: true }, request); }
       await env.HANA_KV.put('extra_' + body.key, JSON.stringify(body.data));
       return json({ ok: true }, request);
     }
     if (path === '/extra' && request.method === 'GET') {
       const key = url.searchParams.get('key');
       if (!key) return new Response('{"passwords":[],"memos":[]}', { headers: { 'Content-Type': 'application/json', ...cors(request) } });
+      if (mode !== 'full') return new Response(await extraGet(env, request, key, mode, who), { headers: { 'Content-Type': 'application/json', ...cors(request) } });
       const data = await env.HANA_KV.get('extra_' + key);
       return new Response(data || '{"passwords":[],"memos":[]}', { headers: { 'Content-Type': 'application/json', ...cors(request) } });
+    }
+    if (path === '/feed' && request.method === 'GET') {
+      const text = await feedFor(env, url.searchParams.get('room'), url.searchParams.get('ch'));
+      if (text === null) return new Response('', { status: 404, headers: cors(request) });
+      return new Response(text, { headers: { 'Content-Type': 'text/calendar', ...cors(request) } });
     }
     if (path === '/sync' && request.method === 'POST') {
       const result = await syncAllRooms(env);
@@ -44,8 +66,12 @@ export default {
       try {
         let fixed = applyDaylock(JSON.parse(data || '{}'), await readDaylock(env));
         fixed = await applyUntrim(env, fixed);
+        if (mode !== 'full') {   // 청소 열쇠 — 전화 끝 4자리(ph)는 사장님만 (cleaner-link)
+          for (const data of Object.values(fixed)) if (data && data.ab) data.ab = data.ab.map(({ ph: _p, ...b }) => b);
+        }
         return new Response(JSON.stringify(fixed), { headers: { 'Content-Type': 'application/json', ...cors(request) } });
       } catch (e) {
+        if (mode !== 'full') return json({}, request);   // 실패해도 원본(ph 포함)으로 물러서지 않는다
         return new Response(data || '{}', { headers: { 'Content-Type': 'application/json', ...cors(request) } });
       }
     }
@@ -1606,11 +1632,301 @@ async function migrateMemos(env, dry) {
   return report;
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// 청소 전용 링크 (cleaner-link, 2026-10-20)
+// ══════════════════════════════════════════════════════════════════════════
+// 왜: 청소 인력(알바, 자주 바뀜)이 도어락 번호를 세팅한다. 번호를 외워 손님이 없을 때 들어가는 일을 막으려면
+//     '누가 언제 어느 방 번호를 봤나'가 남아야 한다. 그리고 앱을 거치지 않는 뒷문(#38)도 같이 잠가야 기록이 의미가 있다.
+// 열쇠 2종 — 머리글 X-Hana-Key
+//   사장님 열쇠: KV access_owner(해시) 또는 워커 비밀값 OWNER_KEY(Cloudflare 설정 화면 — 분실 시 복구용)
+//   청소 열쇠  : KV access_links 의 사람별 열쇠(해시). 처음 연 기기(X-Hana-Dev) 한 대에 묶인다. 다른 기기는 사장님 허용 후
+// 모드 (accessMode)
+//   full      사장님 — 전부 / 또는 열쇠 없음 + 잠금 꺼짐(예전 그대로, 전환 기간용)
+//   clean     청소 열쇠 정상 — 비밀번호는 오늘 체크인·체크아웃 서랍만, 볼 때마다 기록
+//   cleanNoPw 청소 열쇠가 대기·중지 + 잠금 꺼짐 — 달력은 보되 비밀번호는 없음
+//   deny      잠금 켜짐 + (열쇠 없음 | 대기 | 중지) — 403
+// ⛔ 잠금(access_enforce)이 꺼져 있으면 열쇠 없는 요청은 이전과 바이트 단위로 같아야 한다
+// ⛔ '못 읽음'을 '비어 있음'으로 보지 말 것 — access_links 를 못 읽으면 쓰지 않는다 (#22·#26)
+// ⛔ /ical 내보내기 · /sync · cron · /push · 진단 길은 건드리지 않는다
+// 상세: docs/features/cleaner-link.md
+const ACCESS_LINKS_KEY   = 'access_links';
+const ACCESS_OWNER_KEY   = 'access_owner';
+const ACCESS_LOG_KEY     = 'access_log';
+const ACCESS_ENFORCE_KEY = 'access_enforce';
+const ACCESS_LOG_MAX     = 5000;
+const ACCESS_LOG_DAYS    = 90;
+const ACCESS_VIEW_MERGE  = 10 * 60 * 1000;   // 같은 사람·같은 서랍 재열람은 10분 안이면 한 줄
+const FEED_FIELD = { ab: 'url', bk: 'bkUrl', tr: 'trUrl', lv: 'lvUrl' };
+
+async function sha256hex(s) {
+  const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+function randKey(n) {
+  const a = crypto.getRandomValues(new Uint8Array(n));
+  return btoa(String.fromCharCode(...a)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+const kstDay = ms => { const d = new Date(ms + 9 * 3600 * 1000); return ymdStr(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
+// 명단에 보여줄 폰 이름. 웹 앱은 전화번호·기기 주인을 알 수 없다 — 기종·브라우저까지만
+function uaLabel(ua) {
+  ua = ua || '';
+  const dev = /iPhone/.test(ua) ? '아이폰' : /iPad/.test(ua) ? '아이패드' : /SM-|Galaxy|SAMSUNG/i.test(ua) ? '갤럭시'
+    : /Android/.test(ua) ? '안드로이드' : /Windows/.test(ua) ? '윈도우 PC' : /Macintosh/.test(ua) ? '맥' : '기타';
+  const br = /KAKAOTALK/i.test(ua) ? '카톡' : /SamsungBrowser/.test(ua) ? '삼성 인터넷' : /CriOS|Chrome/.test(ua) ? '크롬'
+    : /Safari/.test(ua) ? '사파리' : '';
+  return br ? `${dev} ${br}` : dev;
+}
+
+// 명단 — isolate 메모리에 30초 캐시 (요청마다 KV 를 읽지 않게). 중지가 반영되기까지 최대 30초
+let _links = null, _linksAt = 0;
+async function readLinks(env, fresh) {
+  if (!fresh && _links && Date.now() - _linksAt < 30000) return _links;
+  const raw = await env.HANA_KV.get(ACCESS_LINKS_KEY);
+  const d = raw === null ? [] : JSON.parse(raw);   // 깨졌으면 던진다 — 호출부가 '못 읽음'으로 처리
+  if (!Array.isArray(d)) throw new Error('access_links 모양 이상');
+  _links = d; _linksAt = Date.now();
+  return d;
+}
+// 한 사람만 고친다 — 매번 KV 에서 새로 읽고, 못 읽으면 쓰지 않는다
+async function editLink(env, id, fn) {
+  const links = await readLinks(env, true);
+  const l = links.find(x => x.id === id);
+  if (!l) return null;
+  fn(l);
+  await env.HANA_KV.put(ACCESS_LINKS_KEY, JSON.stringify(links));
+  _links = links; _linksAt = Date.now();
+  return l;
+}
+async function isEnforced(env) { return (await env.HANA_KV.get(ACCESS_ENFORCE_KEY)) === '1'; }
+
+async function whoIs(env, request) {
+  const key = request.headers.get('X-Hana-Key') || '';
+  if (!key) return { role: 'none' };
+  if (env.OWNER_KEY && key === env.OWNER_KEY) return { role: 'owner' };
+  const kh = await sha256hex(key);
+  if ((await env.HANA_KV.get(ACCESS_OWNER_KEY)) === kh) return { role: 'owner' };
+  let links;
+  try { links = await readLinks(env); } catch (e) { return { role: 'none', kh }; }
+  const link = links.find(l => l.key === kh);
+  if (!link) return { role: 'none', kh, unknown: true };
+  if (!link.on) return { role: 'clean', link, state: 'stopped' };
+  const dev = request.headers.get('X-Hana-Dev') || '';
+  if (!dev) return { role: 'clean', link, state: 'pending' };
+  const dh = await sha256hex(dev), ua = uaLabel(request.headers.get('User-Agent'));
+  const today = kstDay(Date.now());
+  const devs = link.devices || [];
+  const d = devs.find(x => x.dev === dh);
+  try {
+    if (d && d.ok) {
+      if (link.lastDay !== today) await editLink(env, link.id, l => { l.lastDay = today; l.lastUsed = Date.now(); });
+      return { role: 'clean', link, state: 'ok' };
+    }
+    if (d) return { role: 'clean', link, state: 'rejected' };
+    if (!devs.some(x => x.ok)) {   // 처음 연 기기 → 이 사람 폰으로 묶는다
+      await editLink(env, link.id, l => {
+        l.devices = [...(l.devices || []), { dev: dh, ua, first: Date.now(), ok: true }];
+        l.pending = (l.pending || []).filter(p => p.dev !== dh);
+        l.lastDay = today; l.lastUsed = Date.now();
+      });
+      return { role: 'clean', link, state: 'ok' };
+    }
+    if (!(link.pending || []).some(p => p.dev === dh)) {   // 다른 기기 → 사장님 확인 대기 (한 번만 올린다)
+      await editLink(env, link.id, l => { l.pending = [...(l.pending || []), { dev: dh, ua, ts: Date.now() }].slice(-5); });
+    }
+  } catch (e) {}
+  return { role: 'clean', link, state: 'pending' };
+}
+
+async function accessMode(env, who) {
+  if (who.role === 'owner') return 'full';
+  if (who.role === 'clean' && who.state === 'ok') return 'clean';
+  if (await isEnforced(env)) return 'deny';
+  return who.role === 'clean' ? 'cleanNoPw' : 'full';
+}
+
+// 기록 — 최신이 앞. 볼 때·바꿀 때·거절될 때만 쓴다 (KV 쓰기 한도)
+async function logAccess(env, row) {
+  let log;
+  try { const raw = await env.HANA_KV.get(ACCESS_LOG_KEY); log = raw === null ? [] : JSON.parse(raw); } catch (e) { return; }
+  if (!Array.isArray(log)) return;
+  const now = Date.now();
+  row = { ts: now, ...row };
+  if (row.act === 'view' && log.some(e => e.act === 'view' && e.id === row.id && e.key === row.key && now - e.ts < ACCESS_VIEW_MERGE)) return;
+  if (row.act === 'deny' && log.some(e => e.act === 'deny' && e.id === row.id && kstDay(e.ts) === kstDay(now))) return;
+  const cut = now - ACCESS_LOG_DAYS * DAY;
+  log = [row, ...log.filter(e => e.ts >= cut)].slice(0, ACCESS_LOG_MAX);
+  await env.HANA_KV.put(ACCESS_LOG_KEY, JSON.stringify(log));
+}
+async function logDeny(env, who) {
+  if (who.role === 'clean') await logAccess(env, { id: who.link.id, name: who.link.name, act: 'deny', state: who.state });
+  else if (who.unknown) await logAccess(env, { id: 'k:' + who.kh.slice(0, 8), name: '모르는 링크', act: 'deny' });
+}
+const denyResp = (request, who) => json({ error: 'locked', state: who.role === 'clean' ? who.state : 'nokey' }, request, 403);
+
+// 서랍(호실|입실일[_꼬리])이 오늘 체크인(in)·체크아웃(out) 인가. 재료는 /bookings 와 같은 교정본 —
+// ⚠ 부킹·트립은 자정에 오늘 퇴실분을 피드에서 잘라내므로 원본만 보면 오늘 퇴실 서랍을 못 찾는다
+async function todayDrawerRole(env, key) {
+  const m = key.match(MEMO_DRAWER_RE);
+  if (!m) return null;
+  const [, room, cin, sfx] = m, ch = sfx || 'ab';
+  const t = todayKST(), today = ymdStr(t.y, t.m, t.d);
+  if (cin === today) return 'in';
+  if (ch === 'bl') {
+    let blocks = [];
+    try { blocks = JSON.parse(await env.HANA_KV.get('extra_manual_blocks') || '[]'); } catch (e) {}
+    const bl = Array.isArray(blocks) && blocks.find(b => b.roomName === room && ymdStr(b.startY, b.startM, b.startD) === cin);
+    return bl && blockCout(bl) === today ? 'out' : null;
+  }
+  let fixed = applyDaylock(JSON.parse(await env.HANA_KV.get('synced_bookings') || '{}'), await readDaylock(env));
+  fixed = await applyUntrim(env, fixed);
+  return (((fixed[room] || {})[ch]) || []).some(b => bkCin(b) === cin && bkCout(b) === today) ? 'out' : null;
+}
+// 에어비앤비 자동 번호 (airbnb-auto-pw 의 ph) — 서랍의 입실일로 찾는다
+async function autoPhFor(env, key) {
+  const m = key.match(MEMO_DRAWER_RE);
+  if (!m || m[3]) return '';
+  try {
+    const ab = ((JSON.parse(await env.HANA_KV.get('synced_bookings') || '{}')[m[1]]) || {}).ab || [];
+    const b = ab.find(x => bkCin(x) === m[2] && x.ph);
+    return b ? b.ph : '';
+  } catch (e) { return ''; }
+}
+const isDrawerKey = k => typeof k === 'string' && k.includes('|');
+
+// GET /extra?key=<서랍> — 모드별
+async function extraGet(env, request, key, mode, who) {
+  const raw = await env.HANA_KV.get('extra_' + key);
+  if (mode === 'full' || !isDrawerKey(key)) return raw || '{"passwords":[],"memos":[]}';
+  let d = { passwords: [], memos: [] };
+  try { d = { ...d, ...JSON.parse(raw || '{}') }; } catch (e) {}
+  const role = mode === 'clean' ? await todayDrawerRole(env, key) : null;
+  if (!role) return JSON.stringify({ ...d, passwords: [], open: false });
+  const auto = await autoPhFor(env, key);
+  const m = key.match(MEMO_DRAWER_RE);
+  await logAccess(env, { id: who.link.id, name: who.link.name, room: m ? m[1] : key, key, role, act: 'view' });
+  return JSON.stringify({ ...d, open: true, ...(auto ? { auto } : {}) });
+}
+// POST /extra — 비밀번호를 볼 수 없는 요청이면 서버의 비밀번호를 그대로 둔다 (빈칸으로 받은 앱이 메모만 고쳐도 번호가 안 지워지게)
+async function extraPost(env, key, data, mode, who) {
+  if (mode === 'full' || !isDrawerKey(key)) { await env.HANA_KV.put('extra_' + key, JSON.stringify(data)); return; }
+  let cur = { passwords: [], memos: [] };
+  try { cur = { ...cur, ...JSON.parse(await env.HANA_KV.get('extra_' + key) || '{}') }; } catch (e) {}
+  const role = mode === 'clean' ? await todayDrawerRole(env, key) : null;
+  const { open: _o, auto: _a, ...clean } = data || {};
+  const next = { ...clean, passwords: role ? (clean.passwords || []) : cur.passwords };
+  await env.HANA_KV.put('extra_' + key, JSON.stringify(next));
+  if (role) {
+    const before = (cur.passwords || [])[0]?.pw || '', after = (next.passwords || [])[0]?.pw || '';
+    if (before !== after) {
+      const m = key.match(MEMO_DRAWER_RE);
+      await logAccess(env, { id: who.link.id, name: who.link.name, room: m ? m[1] : key, key, role, act: after ? 'set' : 'del', pw: after || before });
+    }
+  }
+}
+
+// GET /feed?room=&ch= — 청소앱이 원주소를 몰라도 달력을 받게. 에어비앤비는 설명 줄(전화 끝 4자리)을 전부 지운다
+async function feedFor(env, room, ch) {
+  const f = FEED_FIELD[ch];
+  if (!f) return null;
+  let rooms = [];
+  try { rooms = JSON.parse(await env.HANA_KV.get('rooms') || '[]'); } catch (e) {}
+  const r = rooms.find(x => x.name === room);
+  if (!r || !r[f]) return null;
+  const resp = await fetch(r[f].replace(/^webcal:\/\//i, 'https://'));
+  if (!resp.ok) return null;
+  let text = await resp.text();
+  if (ch === 'bk' || ch === 'tr') { try { text = await fixIcalText(env, text, room, ch); } catch (e) {} }
+  if (ch === 'ab') text = text.replace(/\r?\n[ \t]/g, '').replace(/^DESCRIPTION[;:][^\r\n]*\r?\n/gm, '');
+  return text;
+}
+
+// /access/* — 앱이 '나는 누구'를 묻는 길 · 사장님 열쇠 만들기 · 명단 관리 · 기록 보기
+async function handleAccess(env, request, url, path, who) {
+  const isOwner = who.role === 'owner';
+  if (path === '/access/me' && request.method === 'GET') {
+    const enforce = await isEnforced(env);
+    if (isOwner) return json({ role: 'owner', enforce }, request);
+    if (who.role === 'clean') return json({ role: 'clean', name: who.link.name, state: who.state, enforce }, request);
+    return json({ role: 'none', unknown: !!who.unknown, claimed: (await env.HANA_KV.get(ACCESS_OWNER_KEY)) !== null, enforce }, request);
+  }
+  // 사장님 열쇠가 아직 없을 때 딱 한 번. 열쇠는 여기서 만들어 돌려주고 해시만 저장한다 (누구도 원문을 보관하지 않게)
+  if (path === '/access/owner/claim' && request.method === 'POST') {
+    if ((await env.HANA_KV.get(ACCESS_OWNER_KEY)) !== null) return json({ error: '이미 사장님 열쇠가 있어요' }, request, 409);
+    const key = randKey(24);
+    await env.HANA_KV.put(ACCESS_OWNER_KEY, await sha256hex(key));
+    return json({ key }, request);
+  }
+  if (!isOwner) return json({ error: 'owner only' }, request, 403);
+  if (path === '/access/links' && request.method === 'GET') {
+    let links, log = [];
+    try { links = await readLinks(env, true); } catch (e) { return json({ error: '명단을 못 읽었어요' }, request, 503); }
+    try { log = JSON.parse(await env.HANA_KV.get(ACCESS_LOG_KEY) || '[]'); } catch (e) {}
+    const month = kstDay(Date.now()).slice(0, 6);
+    return json({
+      enforce: await isEnforced(env),
+      links: links.map(l => ({
+        id: l.id, name: l.name, on: l.on, created: l.created, lastUsed: l.lastUsed || null,
+        devices: (l.devices || []).map(d => ({ id: d.dev.slice(0, 12), ua: d.ua, first: d.first, ok: d.ok })),
+        pending: (l.pending || []).map(p => ({ id: p.dev.slice(0, 12), ua: p.ua, ts: p.ts })),
+        views: log.filter(e => e.id === l.id && e.act === 'view' && kstDay(e.ts).slice(0, 6) === month).length,
+      })),
+    }, request);
+  }
+  if (path === '/access/links' && request.method === 'POST') {
+    const b = await request.json();
+    try {
+      if (b.op === 'enforce') {
+        if (b.on) await env.HANA_KV.put(ACCESS_ENFORCE_KEY, '1'); else await env.HANA_KV.delete(ACCESS_ENFORCE_KEY);
+        await logAccess(env, { id: 'owner', name: '사장님', act: b.on ? 'lock-on' : 'lock-off' });
+        return json({ ok: true }, request);
+      }
+      if (b.op === 'add') {
+        const name = String(b.name || '').trim().slice(0, 20);
+        if (!name) return json({ error: '이름이 없어요' }, request, 400);
+        const links = await readLinks(env, true);
+        const key = randKey(18), id = randKey(6);
+        links.push({ id, name, key: await sha256hex(key), on: true, created: Date.now(), devices: [], pending: [] });
+        await env.HANA_KV.put(ACCESS_LINKS_KEY, JSON.stringify(links));
+        _links = links; _linksAt = Date.now();
+        await logAccess(env, { id, name, act: 'add' });
+        return json({ id, key }, request);
+      }
+      const key = b.op === 'renew' ? randKey(18) : null;   // 새 링크 — 옛 링크·묶인 폰은 끊긴다
+      const kh = key ? await sha256hex(key) : null;
+      const l = await editLink(env, b.id, l => {
+        const devMatch = x => x.dev.slice(0, 12) === b.dev;
+        if (b.op === 'stop') l.on = false;
+        else if (b.op === 'resume') l.on = true;
+        else if (b.op === 'approve' || b.op === 'reject') {
+          const p = (l.pending || []).find(devMatch);
+          if (p) {
+            l.pending = l.pending.filter(x => !devMatch(x));
+            l.devices = [...(l.devices || []).filter(x => !devMatch(x)), { dev: p.dev, ua: p.ua, first: p.ts, ok: b.op === 'approve' }];
+          }
+        } else if (b.op === 'renew') {
+          l.key = kh; l.devices = []; l.pending = [];
+        }
+      });
+      if (!l) return json({ error: '없는 사람이에요' }, request, 404);
+      await logAccess(env, { id: l.id, name: l.name, act: b.op });
+      return json(key ? { ok: true, key } : { ok: true }, request);
+    } catch (e) { return json({ error: '명단을 못 읽었어요. 다시 해 주세요' }, request, 503); }
+  }
+  if (path === '/access/log' && request.method === 'GET') {
+    let log = [];
+    try { log = JSON.parse(await env.HANA_KV.get(ACCESS_LOG_KEY) || '[]'); } catch (e) {}
+    const q = url.searchParams.get('name'), lim = Math.min(+url.searchParams.get('limit') || 500, ACCESS_LOG_MAX);
+    return json((q ? log.filter(e => e.name === q) : log).slice(0, lim), request);
+  }
+  return json({ error: 'not found' }, request, 404);
+}
+
 function json(data, request, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', ...cors(request) } });
 }
 function cors(request) {
   const origin = (request && request.headers.get('Origin')) || '';
   const allowed = ALLOWED.some(d => origin === 'https://' + d || origin === 'http://' + d);
-  return { 'Access-Control-Allow-Origin': allowed ? origin : '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
+  return { 'Access-Control-Allow-Origin': allowed ? origin : '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Hana-Key, X-Hana-Dev', 'Access-Control-Max-Age': '86400' };   // 열쇠 머리글 (cleaner-link)
 }
