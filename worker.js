@@ -676,7 +676,8 @@ function todayKST() {
 //     파일 내용으로는 진짜 예약과 구분할 수 없다. 그래서 '시각'으로 가른다.
 // 자물쇠 2개, 둘 다 맞을 때만 걷어낸다:
 //   ① 안전창(07:30~17:30) 마지막 관측에 그 밤이 비어 있었다  → 손님이면 낮에도 막혀 있었을 것
-//   ② 18:00~18:10 차례에 처음 나타났다                       → 자동 규칙의 지문 (실측 18:00:57~18:01:01)
+//   ② 18:00 이후(자정 전)에 그 밤이 막혔다                   → 자동 규칙의 지문 (실측 18:00:57~18:01:01)
+//      원래 18:00~18:10 '처음 등장'이었으나 피드 끊김에 놓쳐 넓혔다 (2026-10-26, 402호 유령 1박)
 // 하나라도 어긋나면 원본 그대로 둔다. 헷갈리면 무조건 막는 쪽 = 오버부킹이 나는 방향으로 안 틀린다.
 // 상세: docs/features/trip-daylock.md
 const SAFE_FROM_MIN = 7 * 60 + 30;    // KST 07:30 — 안전창 시작
@@ -739,7 +740,7 @@ async function updateDaylock(env, synced) {
   if (st.day !== today) { st.day = today; st.seen = {}; }   // fake 는 이월한다 (자정 넘김)
 
   const inSafe = t.min >= SAFE_FROM_MIN && t.min <= SAFE_TO_MIN;
-  const inLock = t.min >= LOCK_FROM_MIN && t.min <= LOCK_TO_MIN;
+  const inLock = t.min >= LOCK_FROM_MIN;   // 18:00~자정. LOCK_TO_MIN 은 소급 청소(알림 도장)용
   const todayMs = dayMs(t.y, t.m, t.d);
   const oldest  = dayMs(t.y, t.m, t.d - 1);   // 잠긴 밤이 어제보다 오래되면 버린다
 
@@ -750,14 +751,21 @@ async function updateDaylock(env, synced) {
       delete st.fake[room];                       // 낮에는 잠금이 없다
       continue;
     }
-    // 이미 판정된 건: 피드가 그 밤을 더 이상 안 덮으면 스스로 정리 (07:00 해제 시 자동)
+    // 이미 판정된 건: 그 밤이 지날 때까지 유지한다 (다음 날 07:30 안전창이 지운다).
+    // ⚠ 피드에서 사라졌다고 지우지 않는다 — 트립 피드는 하루에도 여러 번 5~15분씩 통째로 빈다
+    //   (9/22~10/26 실측: 사라졌다 돌아온 406회 중 403회가 16분 안에 복귀).
+    //   옛날엔 그때 지웠다가, 다시 나타난 걸 진짜로 오인해 장부에 적었다
+    //   → 402호 10/25 밤이 10/26 아침 '1박 오늘 퇴실' 유령으로 떴다.
+    // 유지해도 되는 이유: 18시 이후엔 트립이 그날 밤 판매를 막는다. 사장님이 손으로 풀지 않는 한
+    //   그 밤에 트립 진짜 예약이 들어올 길이 없다 (사용자 확인 2026-10-26 — 손으로 풀지 않음).
     const f = st.fake[room];
     if (f) {
-      const nightMs = ymdMs(f.night);
-      if (nightMs < oldest || !coversNight(tr, nightMs)) delete st.fake[room];
+      if (ymdMs(f.night) < oldest) delete st.fake[room];
       continue;
     }
-    // 자물쇠 ① 안전창에 비어 있었다  +  ② 18:00~18:10 차례에 처음 나타났다
+    // 자물쇠 ① 안전창에 비어 있었다  +  ② 18:00 이후(자정 전) 그날 밤이 막혔다
+    // ②는 원래 '18:00~18:10 차례에 처음 나타남'이었다. 그 10분에 피드가 비어 있으면 놓쳤다.
+    // 자정이 지나면 seen 이 초기화돼(undefined) 새 판정은 안 생긴다 — 새벽 예약은 진짜로 둔다.
     if (st.seen[room] === false && inLock && coversNight(tr, todayMs)) {
       st.fake[room] = { night: today, min: t.min };
     }
