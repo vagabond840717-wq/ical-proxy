@@ -15,7 +15,7 @@ export default {
 
     // 청소 전용 링크 (cleaner-link) — 비밀번호·원주소가 나가는 길만 누구인지 본다
     let who = null, mode = 'full';
-    if (['/rooms', '/extra', '/bookings', '/feed'].includes(path) || path.startsWith('/access/')) {
+    if (['/rooms', '/extra', '/bookings', '/feed', '/hold/release'].includes(path) || path.startsWith('/access/')) {
       who = await whoIs(env, request);
       if (path.startsWith('/access/')) return await handleAccess(env, request, url, path, who);
       mode = await accessMode(env, who);
@@ -76,6 +76,20 @@ export default {
       }
     }
     // 트립 당일잠금 판정 상태 — 진단용 읽기 전용
+    if (path === '/hold/release' && request.method === 'POST') {
+      // 사장님이 '확인했어요 — 풀기'. 보여준 밤 목록을 같이 받아 그 밤들만 풀게 한다 (그 뒤 더 빠진 밤은 다시 묻는다)
+      if (mode !== 'full') return json({ error: '사장님만' }, request, 403);
+      const b = await request.json().catch(() => ({}));
+      const st = JSON.parse(await env.HANA_KV.get('feed_hold') || '{}');
+      if (!b.key || !st[b.key]) return json({ error: '기다리는 항목이 없어요' }, request, 404);
+      const n = Array.isArray(b.n) ? b.n.map(Number).filter(Number.isFinite) : [];
+      const ok = JSON.parse(await env.HANA_KV.get('hold_ok') || '{}');
+      ok[b.key] = { ts: Date.now(), n };
+      await env.HANA_KV.put('hold_ok', JSON.stringify(ok));
+      await syncAllRooms(env);   // 바로 반영
+      const after = JSON.parse(await env.HANA_KV.get('feed_hold') || '{}');
+      return json({ ok: true, released: !after[b.key] || !(after[b.key].q || []).length }, request);
+    }
     if (path === '/hold' && request.method === 'GET') {
       // 피드 끊김 버팀 상태 (진단용) — 호실|채널: 처음 풀린 시각. 비어 있으면 버티는 중인 곳 없음
       const raw = await env.HANA_KV.get('feed_hold') || '{}';
@@ -326,6 +340,8 @@ async function syncAllRooms(env, withPush = false) {
   const holdPrevRaw = await env.HANA_KV.get('feed_hold') || '{}';
   let holdPrev; try { holdPrev = JSON.parse(holdPrevRaw) || {}; } catch (e) { holdPrev = {}; }
   const holdNext = {};
+  let holdOk = {}; try { holdOk = JSON.parse(await env.HANA_KV.get('hold_ok') || '{}') || {}; } catch (e) { holdOk = {}; }
+  const holdOkUsed = new Set();
   const holdNow = Date.now();
   const holdToday = todayKST();
   const failedFeeds = new Set();
@@ -378,9 +394,10 @@ async function syncAllRooms(env, withPush = false) {
       // ⚠ 아카이브·알림에는 받은 그대로(result), 내보내기·화면 재료(synced_bookings)에는 버팀본을 넣는다
       if (HOLD_PLATFORMS.includes(p.key)) {
         const hk = `${room.name}|${p.key}`;
-        const h = holdFeed(prevRoomData[p.key] || [], result, holdPrev[hk], holdNow, holdToday);
-        if (h.since != null) holdNext[hk] = h.since;
-        if (h.released && h.released.length) alarmQueue.push({ kind: 'release', room: room.name, ch: p.key, nights: h.released, whole: h.whole });
+        const h = holdFeed(prevRoomData[p.key] || [], result, holdPrev[hk], holdNow, holdToday, holdOk[hk]);
+        if (h.st) holdNext[hk] = h.st;
+        if (h.confirmed) holdOkUsed.add(hk);
+        if (h.ask) alarmQueue.push({ kind: 'ask', room: room.name, ch: p.key, nights: h.waitNights, whole: h.whole });
         bookings[p.key] = h.out;
       } else {
         bookings[p.key] = result;
@@ -435,6 +452,10 @@ async function syncAllRooms(env, withPush = false) {
   try {
     const holdNextRaw = JSON.stringify(holdNext);
     if (holdNextRaw !== JSON.stringify(holdPrev)) await env.HANA_KV.put('feed_hold', holdNextRaw);
+    // 쓴 확인·더는 기다리지 않는 곳의 확인은 지운다 (남겨두면 다음 일에 잘못 쓰일 수 있다)
+    const okKeys = Object.keys(holdOk);
+    const okNext = Object.fromEntries(okKeys.filter(k => !holdOkUsed.has(k) && holdNext[k]).map(k => [k, holdOk[k]]));
+    if (okKeys.length !== Object.keys(okNext).length) await env.HANA_KV.put('hold_ok', JSON.stringify(okNext));
   } catch (e) {}
 
   // 트립 당일잠금 판정 — 갓 받은 피드로 판단해야 하므로 여기서 한 번만 돌린다.
@@ -538,11 +559,14 @@ async function syncAllRooms(env, withPush = false) {
 //     → 그 5분 동안 /ical 내보내기에서 트립 막힘이 빠짐 → 에어비앤비가 그때 가져가면 날짜가 열림.
 //     2026-11-13 601호: 트립 11/12~11/18 위에 에어비앤비 11/14~11/20 이 21:10 에 들어와 오버부킹.
 //     10/24~11/13 601호만 열린 틈 165번·857분 (#40).
-// 규칙: **막힘은 바로, 풀림은 1시간 지켜본 뒤.**
+// 규칙: **막힘은 바로, 풀림은 사장님이 확인한 뒤.**
 //   - 앞으로의 밤(오늘 밤 포함)이 직전보다 하나라도 풀리면 → 직전 목록을 그대로 유지 (+ 새로 생긴 막힘은 바로 얹음)
-//   - 그 상태가 1시간 내내 이어졌을 때만 새 피드를 믿는다. 중간에 한 번이라도 돌아오면 타이머 초기화
+//   - 1시간 안에 돌아오면 끊김이었다 → 조용히 끝 (실측 끊김은 전부 16분 안)
+//   - 1시간이 지나도 빠져 있으면 → **계속 막은 채로** 사장님께 푸시 · 예약앱 🔔 '풀기' 를 눌러야 연다 (사장님 2026-11-13)
+//     확인한 밤 목록이 전부 포함될 때만 연다. 기다리는 동안 다른 밤이 더 빠지면 다시 묻는다
+//   - 예외: 180일보다 먼 밤만 빠진 건 1시간 뒤 그냥 연다 (부킹이 매일 1년 뒤 판매기간 맨 앞 하룻밤을 연다)
 //   - 지난 밤만 빠지는 건(자정 앞잘림·07시 당일잠금 해제) 풀림이 아니다 → 그대로 통과
-// 대가: 진짜 취소도 다른 채널에서 최대 1시간 늦게 열린다 — 오버부킹 나는 쪽으로는 틀리지 않는다
+// 대가: 진짜 취소도 사장님이 풀 때까지 다른 채널에서 막혀 있다 — 오버부킹 나는 쪽으로는 틀리지 않는다
 // ⛔ 아카이브·알림 기억표·원본 진단(fix 없는 /?url=)에는 받은 그대로 쓴다. 버팀본은 synced_bookings 에만
 // 적용 채널: 트립·부킹·리브 (사장님 2026-11-13 — 에어비앤비끼리는 문제 없고, 다른 채널과 엇갈릴 때 생기는 문제).
 //   에어비앤비는 넣지 않는다. 시간·채널을 바꾸려면 사장님 승인
@@ -550,7 +574,10 @@ async function syncAllRooms(env, withPush = false) {
 const HOLD_PLATFORMS = ['tr', 'bk', 'lv'];
 const HOLD_MS = 1 * 3600 * 1000;
 
-function holdFeed(prevOut, fresh, since, now, today) {
+// st: 직전 상태 { m:{밤:처음 빠진 시각}, q:[이미 물어본 밤] }  — 1시간 타이머는 **밤마다** 따로 잰다
+//     (하나가 확인을 기다리는 동안 5분 끊김이 와도 다시 묻지 않게. 옛 숫자형·{s} 형도 받는다)
+// ok: 사장님 확인 { ts, n:[밤] } — 확인한 밤만 연다
+function holdFeed(prevOut, fresh, st, now, today, ok) {
   const dn = (y, m, d) => Math.round(Date.UTC(y, m, d) / 86400000);
   const todayN = dn(today.y, today.m, today.d);
   const nightsOf = b => {
@@ -559,16 +586,29 @@ function holdFeed(prevOut, fresh, since, now, today) {
     return out;
   };
   const freshNights = new Set(fresh.flatMap(nightsOf));
-  const opened = prevOut.some(b => nightsOf(b).some(n => n >= todayN && !freshNights.has(n)));
-  if (!opened) return { out: fresh, since: null };
-  const start = (typeof since === 'number' && since <= now) ? since : now;
-  if (now - start >= HOLD_MS) {   // 1시간 내내 풀려 있었다 → 믿는다. 무엇이 풀렸는지 알려준다 (알림용)
-    const released = [...new Set(prevOut.flatMap(nightsOf))].filter(n => n >= todayN && !freshNights.has(n)).sort((a, b) => a - b);
-    return { out: fresh, since: null, released, whole: !fresh.some(b => nightsOf(b).some(n => n >= todayN)) };
-  }
+  const opened = [...new Set(prevOut.flatMap(nightsOf))].filter(n => n >= todayN && !freshNights.has(n)).sort((a, b) => a - b);
+  if (!opened.length) return { out: fresh, st: null };
+  const legacyS = typeof st === 'number' ? st : (st && typeof st.s === 'number' ? st.s : null);
+  const pm = (st && st.m) || {};
+  const asked = new Set((st && st.q) || (st && st.a && st.n) || []);
+  const okSet = new Set((ok && ok.n) || []);
+  const m = {};
+  for (const n of opened) { const v = pm[n] ?? legacyS ?? now; m[n] = v <= now ? v : now; }
+  const due  = opened.filter(n => now - m[n] >= HOLD_MS);
+  const near = n => n < todayN + ALARM_REL_DAYS;
+  // 열어도 되는 밤: 1시간 지난 먼 밤(부킹 판매기간 롤링) · 사장님이 확인한 밤
+  const releasable = n => (now - m[n] >= HOLD_MS && !near(n)) || okSet.has(n);
+  if (opened.every(releasable)) return { out: fresh, st: null, confirmed: opened.filter(n => okSet.has(n)) };
   const prevNights = new Set(prevOut.flatMap(nightsOf));
-  const added = fresh.filter(b => nightsOf(b).some(n => !prevNights.has(n)));
-  return { out: [...prevOut, ...added], since: start };
+  const held = [...prevOut, ...fresh.filter(b => nightsOf(b).some(n => !prevNights.has(n)))];
+  const waiting = due.filter(n => near(n) && !okSet.has(n));          // 1시간 넘게 빠져 있고 확인 안 된 밤
+  const fresh_q = waiting.filter(n => !asked.has(n));
+  const q = [...new Set([...asked].filter(n => opened.includes(n)).concat(waiting))].sort((a, b) => a - b);
+  return {
+    out: held, st: { m, q },
+    ask: fresh_q.length > 0, askNights: fresh_q, waitNights: waiting,
+    whole: !fresh.some(b => nightsOf(b).some(n => n >= todayN)),
+  };
 }
 
 // ── 이상 알림 (alarms) — 2026-11-13 ──────────────────────────────────────
@@ -578,7 +618,7 @@ function holdFeed(prevOut, fresh, since, now, today) {
 // ⛔ 같은 일로 두 번 보내지 않는다 — 상태는 KV alarm_state 에, 바뀔 때만 쓴다
 // 종류:
 //   ① overbook  앞 120일 안에 한 방·한 밤을 두 채널이 막고 있음 (에어비앤비 블락·수동 블락 제외). 새로 생긴 밤만
-//   ② release   트립·부킹·리브가 앞날 막힘을 1시간 내내 뺀 채로 와서 풀었음 (통째로 비었으면 '끊김 의심')
+//   ② ask       트립·부킹·리브가 앞날 막힘을 1시간 넘게 뺀 채로 옴 → 막은 채로 확인 요청 (통째로 비었으면 '끊김 의심')
 //   ③ sync      5분 동기화가 연속 실패 (scheduled 에서)
 //   ④ ical      에어비앤비 등이 모르는 방 이름으로 달력을 가져감 → 그 채널은 빈 달력을 받고 있다
 const OB_DAYS = 120;
@@ -637,15 +677,13 @@ async function sendAlarms(env, queue, synced) {
   }
   st.ob = nextOb;
 
-  // ② 1시간 버팀 끝에 푼 것
+  // ② 1시간이 지나도 막힘이 빠져 있음 → 막은 채로 확인 요청
   for (const a of queue || []) {
-    if (a.kind !== 'release') continue;
-    const near = a.nights.filter(n => n < tN + ALARM_REL_DAYS);
-    if (!near.length) continue;
+    if (a.kind !== 'ask') continue;
     const ch = CH_NAME[a.ch] || a.ch;
     msgs.push(a.whole
-      ? { title: `⚠️ ${a.room} ${ch} 달력이 1시간째 비어 있어요`, body: `끊김일 수 있어요. ${ch}에 손님이 있으면 에어비앤비를 직접 닫으세요 (풀린 밤 ${nightRanges(near)})`, room: a.room }
-      : { title: `ℹ️ ${a.room} ${ch} 막힘이 풀렸어요`, body: `${nightRanges(near)} — 1시간째 ${ch} 달력에 없어 다른 채널에서 열었어요. 취소가 맞는지 확인하세요`, room: a.room });
+      ? { title: `🔒 ${a.room} ${ch} 달력이 1시간째 비어 있어요`, body: `끊김일 수 있어 ${nightRanges(a.nights)} 은 계속 막아 둡니다. ${ch}에서 손님을 확인하고 예약앱 🔔 에서 풀어 주세요`, room: a.room }
+      : { title: `🔒 ${a.room} ${ch} 막힘이 빠졌어요`, body: `${nightRanges(a.nights)} — 확인 전까지 다른 채널에서 계속 막아 둡니다. 취소가 맞으면 예약앱 🔔 에서 풀어 주세요`, room: a.room });
   }
 
   for (const m of msgs) await sendPushToAll(env, m);
