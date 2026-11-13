@@ -166,6 +166,11 @@ export default {
       await env.PUSH_KV.put('events', JSON.stringify(updated));
       return json({ ok: true }, request);
     }
+    if (path === '/push/key' && request.method === 'GET') {
+      // 예약앱이 구독할 때 쓰는 공개 열쇠 (비밀 아님)
+      const V = await getVapid(env);
+      return json({ publicKey: V.pub }, request);
+    }
     if (path === '/push/test' && request.method === 'POST') {
       const results = [];
       const keys = await env.PUSH_KV.list({ prefix: 'sub_' });
@@ -175,7 +180,7 @@ export default {
         try {
           const status = await sendWebPush(env, JSON.parse(subJson), { title: '🔔 테스트 알림', body: 'HANA STAY 푸시 알림 정상 작동!' });
           results.push({ key: k.name.slice(0, 20), status });
-          if (status === 410 || status === 404) await env.PUSH_KV.delete(k.name);
+          if (status === 410 || status === 404 || status === 401 || status === 403) await env.PUSH_KV.delete(k.name);
         } catch (e) {
           results.push({ key: k.name.slice(0, 20), error: e.message });
         }
@@ -289,11 +294,36 @@ async function hkdf(salt, ikm, info, len) {
   return new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt, info }, key, len * 8));
 }
 
+// 알림 서명 열쇠 (push-keys, 2026-11-13) — '보낸 사람 도장'
+// 왜: Cloudflare 비밀값 VAPID_PRIVATE_KEY 가 빠져 있어 알림이 하나도 안 나갔다 (만들다 'length' 오류).
+//     비밀값이 있으면 그걸 쓰고, 없으면 워커가 한 번 만들어 KV vapid_keys 에 두고 계속 쓴다.
+//     예약앱은 GET /push/key 로 공개 열쇠를 받아 구독한다 (열쇠가 바뀌면 앱이 알아서 다시 구독).
+// ⛔ vapid_keys 를 지우거나 바꾸면 모든 폰의 구독이 무효가 된다 — 앱을 다시 열어야 복구
+const PUSH_SUBJECT_DEFAULT = 'https://vagabond840717-wq.github.io/booking/';
+let _vapidCache = null;
+async function getVapid(env) {
+  if (env.VAPID_PRIVATE_KEY && env.VAPID_PUBLIC_KEY)
+    return { pub: env.VAPID_PUBLIC_KEY, priv: env.VAPID_PRIVATE_KEY, sub: env.VAPID_SUBJECT || PUSH_SUBJECT_DEFAULT };
+  if (_vapidCache) return _vapidCache;
+  let k = null;
+  try { k = JSON.parse(await env.HANA_KV.get('vapid_keys') || 'null'); } catch (e) { k = null; }
+  if (!k || !k.pub || !k.priv) {
+    const kp = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+    const jwk = await crypto.subtle.exportKey('jwk', kp.privateKey);
+    const pubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+    await env.HANA_KV.put('vapid_keys', JSON.stringify({ pub: bytesToB64(pubRaw), priv: jwk.d, made: Date.now() }));
+    k = JSON.parse(await env.HANA_KV.get('vapid_keys'));   // 동시에 둘이 만들었으면 남은 쪽으로 맞춘다
+  }
+  _vapidCache = { pub: k.pub, priv: k.priv, sub: env.VAPID_SUBJECT || PUSH_SUBJECT_DEFAULT };
+  return _vapidCache;
+}
+
 async function makeVapid(env, endpoint) {
+  const V = await getVapid(env);
   const origin = new URL(endpoint).origin;
   const b64 = o => btoa(JSON.stringify(o)).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
-  const unsigned = b64({ typ: 'JWT', alg: 'ES256' }) + '.' + b64({ aud: origin, exp: Math.floor(Date.now()/1000) + 43200, sub: env.VAPID_SUBJECT });
-  const raw = b64ToBytes(env.VAPID_PRIVATE_KEY);
+  const unsigned = b64({ typ: 'JWT', alg: 'ES256' }) + '.' + b64({ aud: origin, exp: Math.floor(Date.now()/1000) + 43200, sub: V.sub });
+  const raw = b64ToBytes(V.priv);
   const pkcs8 = new Uint8Array([
     0x30,0x41,0x02,0x01,0x00,0x30,0x13,
     0x06,0x07,0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,
@@ -303,7 +333,7 @@ async function makeVapid(env, endpoint) {
   ]);
   const privKey = await crypto.subtle.importKey('pkcs8', pkcs8, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
   const sig = bytesToB64(new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privKey, te(unsigned))));
-  return `vapid t=${unsigned}.${sig}, k=${env.VAPID_PUBLIC_KEY}`;
+  return `vapid t=${unsigned}.${sig}, k=${V.pub}`;
 }
 
 const te = s => new TextEncoder().encode(s);
@@ -809,7 +839,7 @@ async function sendPushToAll(env, data) {
     if (!subJson) continue;
     try {
       const status = await sendWebPush(env, JSON.parse(subJson), data);
-      if (status === 410 || status === 404) await env.PUSH_KV.delete(k.name);
+      if (status === 410 || status === 404 || status === 401 || status === 403) await env.PUSH_KV.delete(k.name);   // 403 = 다른 도장으로 만든 옛 구독
       else sent++;
     } catch(e) {}
   }
