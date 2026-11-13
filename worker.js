@@ -398,6 +398,7 @@ async function syncAllRooms(env, withPush = false) {
         if (h.st) holdNext[hk] = h.st;
         if (h.confirmed) holdOkUsed.add(hk);
         if (h.ask) alarmQueue.push({ kind: 'ask', room: room.name, ch: p.key, nights: h.waitNights, whole: h.whole });
+        if (h.recovered && h.recovered.length) alarmQueue.push({ kind: 'back', room: room.name, ch: p.key, nights: h.recovered, still: (h.waitNights || []).filter(n => !h.recovered.includes(n)) });
         bookings[p.key] = h.out;
       } else {
         bookings[p.key] = result;
@@ -586,8 +587,11 @@ function holdFeed(prevOut, fresh, st, now, today, ok) {
     return out;
   };
   const freshNights = new Set(fresh.flatMap(nightsOf));
+  // 이미 사장님께 물어본 밤 중 피드에 다시 나타난 것 → '신호 돌아옴' 알림용 (확인 안 해도 된다)
+  const askedBefore = (st && (st.q || (st.a && st.n))) || [];
+  const recovered = askedBefore.filter(n => n >= todayN && freshNights.has(n));
   const opened = [...new Set(prevOut.flatMap(nightsOf))].filter(n => n >= todayN && !freshNights.has(n)).sort((a, b) => a - b);
-  if (!opened.length) return { out: fresh, st: null };
+  if (!opened.length) return { out: fresh, st: null, recovered, waitNights: [] };
   const legacyS = typeof st === 'number' ? st : (st && typeof st.s === 'number' ? st.s : null);
   const pm = (st && st.m) || {};
   const asked = new Set((st && st.q) || (st && st.a && st.n) || []);
@@ -598,7 +602,7 @@ function holdFeed(prevOut, fresh, st, now, today, ok) {
   const near = n => n < todayN + ALARM_REL_DAYS;
   // 열어도 되는 밤: 1시간 지난 먼 밤(부킹 판매기간 롤링) · 사장님이 확인한 밤
   const releasable = n => (now - m[n] >= HOLD_MS && !near(n)) || okSet.has(n);
-  if (opened.every(releasable)) return { out: fresh, st: null, confirmed: opened.filter(n => okSet.has(n)) };
+  if (opened.every(releasable)) return { out: fresh, st: null, confirmed: opened.filter(n => okSet.has(n)), recovered, waitNights: [] };
   const prevNights = new Set(prevOut.flatMap(nightsOf));
   const held = [...prevOut, ...fresh.filter(b => nightsOf(b).some(n => !prevNights.has(n)))];
   const waiting = due.filter(n => near(n) && !okSet.has(n));          // 1시간 넘게 빠져 있고 확인 안 된 밤
@@ -606,7 +610,7 @@ function holdFeed(prevOut, fresh, st, now, today, ok) {
   const q = [...new Set([...asked].filter(n => opened.includes(n)).concat(waiting))].sort((a, b) => a - b);
   return {
     out: held, st: { m, q },
-    ask: fresh_q.length > 0, askNights: fresh_q, waitNights: waiting,
+    ask: fresh_q.length > 0, askNights: fresh_q, waitNights: waiting, recovered,
     whole: !fresh.some(b => nightsOf(b).some(n => n >= todayN)),
   };
 }
@@ -621,6 +625,7 @@ function holdFeed(prevOut, fresh, st, now, today, ok) {
 //   ② ask       트립·부킹·리브가 앞날 막힘을 1시간 넘게 뺀 채로 옴 → 막은 채로 확인 요청 (통째로 비었으면 '끊김 의심')
 //   ③ sync      5분 동기화가 연속 실패 (scheduled 에서)
 //   ④ ical      에어비앤비 등이 모르는 방 이름으로 달력을 가져감 → 그 채널은 빈 달력을 받고 있다
+//   ⑤ back      ② 로 물어본 밤이 피드에 돌아옴 → '확인 안 해도 돼요' (남은 밤은 계속 막고 같이 알림)
 const OB_DAYS = 120;
 const ALARM_REL_DAYS = 180;   // 이보다 먼 밤이 풀린 건 알리지 않는다 (부킹 판매기간 맨 앞 하룻밤이 매일 열림)
 const CH_NAME = { ab: '에어비앤비', bk: '부킹', tr: '트립', lv: '리브' };
@@ -684,6 +689,15 @@ async function sendAlarms(env, queue, synced) {
     msgs.push(a.whole
       ? { title: `🔒 ${a.room} ${ch} 달력이 1시간째 비어 있어요`, body: `끊김일 수 있어 ${nightRanges(a.nights)} 은 계속 막아 둡니다. ${ch}에서 손님을 확인하고 예약앱 🔔 에서 풀어 주세요`, room: a.room }
       : { title: `🔒 ${a.room} ${ch} 막힘이 빠졌어요`, body: `${nightRanges(a.nights)} — 확인 전까지 다른 채널에서 계속 막아 둡니다. 취소가 맞으면 예약앱 🔔 에서 풀어 주세요`, room: a.room });
+  }
+
+  // ③ 확인 기다리던 밤이 피드에 돌아옴 — 알아서 정리됐다고 알린다 (남은 밤이 있으면 그건 계속 막아 둠)
+  for (const a of queue || []) {
+    if (a.kind !== 'back') continue;
+    const ch = CH_NAME[a.ch] || a.ch;
+    msgs.push(a.still && a.still.length
+      ? { title: `↩️ ${a.room} ${ch} 신호가 돌아왔어요`, body: `${nightRanges(a.nights)} 은 예약 그대로예요. 다만 ${nightRanges(a.still)} 은 여전히 없어 계속 막아 둡니다 — 확인 후 풀어 주세요`, room: a.room }
+      : { title: `✅ ${a.room} ${ch} 신호가 돌아왔어요`, body: `${nightRanges(a.nights)} 예약 그대로예요. 확인 안 하셔도 돼요`, room: a.room });
   }
 
   for (const m of msgs) await sendPushToAll(env, m);
