@@ -207,7 +207,10 @@ export default {
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
-      await syncAllRooms(env, true);
+      // 동기화가 멈추면 알린다 (alarms ③). 실패하면 원장·메모는 건너뛴다 — 낡은 피드로 굳히면 안 된다
+      try { await syncAllRooms(env, true); }
+      catch (e) { try { await noteSyncResult(env, false, e && e.message); } catch (_) {} return; }
+      try { await noteSyncResult(env, true); } catch (e) {}
       // 원장 굳히기는 동기화 성공 후에만. 실패하면 피드가 낡은 상태라 굳히면 안 된다.
       // 여기서 던지면 sync 결과까지 오류로 묻히므로 삼킨다 — 5분 뒤 다음 tick 이 이어받는다.
       try { await freezeLedger(env); } catch (e) {}
@@ -326,6 +329,7 @@ async function syncAllRooms(env, withPush = false) {
   const holdNow = Date.now();
   const holdToday = todayKST();
   const failedFeeds = new Set();
+  const alarmQueue = [];   // 이상 알림 (alarms) — 루프가 끝난 뒤 한꺼번에 보낸다
   // 병렬 처리 결과를 호실 배열 순서대로 모아두고, 루프가 끝난 뒤 고정된 순서로 합친다
   // (Promise.all 완료 순서는 매번 달라서, 그 순서로 바로 객체에 써넣으면 키 순서가 흔들려
   //  내용이 같아도 JSON 문자열이 달라져 불필요한 KV 쓰기가 발생함)
@@ -376,6 +380,7 @@ async function syncAllRooms(env, withPush = false) {
         const hk = `${room.name}|${p.key}`;
         const h = holdFeed(prevRoomData[p.key] || [], result, holdPrev[hk], holdNow, holdToday);
         if (h.since != null) holdNext[hk] = h.since;
+        if (h.released && h.released.length) alarmQueue.push({ kind: 'release', room: room.name, ch: p.key, nights: h.released, whole: h.whole });
         bookings[p.key] = h.out;
       } else {
         bookings[p.key] = result;
@@ -441,6 +446,9 @@ async function syncAllRooms(env, withPush = false) {
   //   가짜 잠금은 예약을 항상 길게 만들어 매번 가짜가 이긴다 (8/26~8/30 이 8/27~8/30 을 밀어냄).
   //   장부는 되돌릴 수 없으므로 들어오기 전에 거른다. synced_bookings 원본은 손대지 않는다.
   const freshArchive = applyDaylock(newArchive, daylock);
+
+  // 이상 알림 — 실패해도 동기화 결과는 지킨다
+  try { await sendAlarms(env, alarmQueue, applyDaylock(synced_bookings, daylock)); } catch (e) {}
 
   // 아카이브 병합: synced_bookings와 완전 분리된 별도 저장
   const cutoff = new Date();
@@ -554,10 +562,126 @@ function holdFeed(prevOut, fresh, since, now, today) {
   const opened = prevOut.some(b => nightsOf(b).some(n => n >= todayN && !freshNights.has(n)));
   if (!opened) return { out: fresh, since: null };
   const start = (typeof since === 'number' && since <= now) ? since : now;
-  if (now - start >= HOLD_MS) return { out: fresh, since: null };   // 1시간 내내 풀려 있었다 → 믿는다
+  if (now - start >= HOLD_MS) {   // 1시간 내내 풀려 있었다 → 믿는다. 무엇이 풀렸는지 알려준다 (알림용)
+    const released = [...new Set(prevOut.flatMap(nightsOf))].filter(n => n >= todayN && !freshNights.has(n)).sort((a, b) => a - b);
+    return { out: fresh, since: null, released, whole: !fresh.some(b => nightsOf(b).some(n => n >= todayN)) };
+  }
   const prevNights = new Set(prevOut.flatMap(nightsOf));
   const added = fresh.filter(b => nightsOf(b).some(n => !prevNights.has(n)));
   return { out: [...prevOut, ...added], since: start };
+}
+
+// ── 이상 알림 (alarms) — 2026-11-13 ──────────────────────────────────────
+// 왜: 601호 오버부킹이 21:10 에 생겼는데 사장님은 21:54 화면을 보고서야 알았다. 무방비 상태가 조용히 지나가면 안 된다.
+// 사장님 결정: "이상되는 건 알람이 오게" — 폰 푸시로만 보낸다.
+// ⛔ 알림 목록(events)에는 넣지 않는다 — 예약앱이 모르는 종류는 '취소'로 그린다. 앱을 고칠 때 같이 넣을 것
+// ⛔ 같은 일로 두 번 보내지 않는다 — 상태는 KV alarm_state 에, 바뀔 때만 쓴다
+// 종류:
+//   ① overbook  앞 120일 안에 한 방·한 밤을 두 채널이 막고 있음 (에어비앤비 블락·수동 블락 제외). 새로 생긴 밤만
+//   ② release   트립·부킹·리브가 앞날 막힘을 1시간 내내 뺀 채로 와서 풀었음 (통째로 비었으면 '끊김 의심')
+//   ③ sync      5분 동기화가 연속 실패 (scheduled 에서)
+//   ④ ical      에어비앤비 등이 모르는 방 이름으로 달력을 가져감 → 그 채널은 빈 달력을 받고 있다
+const OB_DAYS = 120;
+const ALARM_REL_DAYS = 180;   // 이보다 먼 밤이 풀린 건 알리지 않는다 (부킹 판매기간 맨 앞 하룻밤이 매일 열림)
+const CH_NAME = { ab: '에어비앤비', bk: '부킹', tr: '트립', lv: '리브' };
+const nightLabel = n => { const d = new Date(n * 86400000); return `${d.getUTCMonth() + 1}/${d.getUTCDate()}`; };
+function nightRanges(nights) {   // [n…] → "11/15~11/17, 12/2"
+  const out = []; let s = null, p = null;
+  for (const n of [...nights].sort((a, b) => a - b)) {
+    if (s === null) { s = p = n; continue; }
+    if (n === p + 1) { p = n; continue; }
+    out.push(s === p ? nightLabel(s) : `${nightLabel(s)}~${nightLabel(p)}`); s = p = n;
+  }
+  if (s !== null) out.push(s === p ? nightLabel(s) : `${nightLabel(s)}~${nightLabel(p)}`);
+  return out.join(', ');
+}
+
+// 한 방에서 같은 밤을 두 채널 이상이 막고 있는 밤들. { room: { night: [ch...] } }
+function findOverbookings(synced, today, days = OB_DAYS) {
+  const dn = (y, m, d) => Math.round(Date.UTC(y, m, d) / 86400000);
+  const t0 = dn(today.y, today.m, today.d), t1 = t0 + days;
+  const res = {};
+  for (const [room, data] of Object.entries(synced || {})) {
+    const by = {};
+    for (const ch of ['ab', 'bk', 'tr', 'lv']) {
+      for (const b of (data && data[ch]) || []) {
+        if (ch === 'ab' && (b.summary || '').toLowerCase().includes('not available')) continue;   // 에어비앤비 블락은 예약 아님
+        const s = Math.max(dn(b.cinY, b.cinM, b.cinD), t0), e = Math.min(dn(b.coutY, b.coutM, b.coutD), t1);
+        for (let n = s; n < e; n++) (by[n] = by[n] || new Set()).add(ch);
+      }
+    }
+    for (const [n, set] of Object.entries(by)) if (set.size >= 2) (res[room] = res[room] || {})[n] = [...set];
+  }
+  return res;
+}
+
+async function sendAlarms(env, queue, synced) {
+  const raw = await env.HANA_KV.get('alarm_state');
+  let st; try { st = JSON.parse(raw || '{}') || {}; } catch (e) { st = {}; }
+  st.ob = st.ob || {};
+  const msgs = [];
+  const today = todayKST();
+  const tN = Math.round(Date.UTC(today.y, today.m, today.d) / 86400000);
+
+  // ① 겹침 — 새로 생긴 밤만 알린다. 풀린 밤은 상태에서 지운다 (다시 생기면 다시 알림)
+  const ob = findOverbookings(synced, today);
+  const nextOb = {};
+  for (const [room, nights] of Object.entries(ob)) {
+    const known = new Set(st.ob[room] || []);
+    const fresh = Object.keys(nights).map(Number).filter(n => !known.has(n));
+    nextOb[room] = Object.keys(nights).map(Number).sort((a, b) => a - b);
+    if (fresh.length) {
+      const chs = [...new Set(fresh.flatMap(n => nights[n]))].map(c => CH_NAME[c] || c).join('+');
+      msgs.push({ title: `🚨 ${room} 오버부킹`, body: `${nightRanges(fresh)} 밤이 겹쳐요 (${chs}). 지금 확인하세요`, room });
+    }
+  }
+  st.ob = nextOb;
+
+  // ② 1시간 버팀 끝에 푼 것
+  for (const a of queue || []) {
+    if (a.kind !== 'release') continue;
+    const near = a.nights.filter(n => n < tN + ALARM_REL_DAYS);
+    if (!near.length) continue;
+    const ch = CH_NAME[a.ch] || a.ch;
+    msgs.push(a.whole
+      ? { title: `⚠️ ${a.room} ${ch} 달력이 1시간째 비어 있어요`, body: `끊김일 수 있어요. ${ch}에 손님이 있으면 에어비앤비를 직접 닫으세요 (풀린 밤 ${nightRanges(near)})`, room: a.room }
+      : { title: `ℹ️ ${a.room} ${ch} 막힘이 풀렸어요`, body: `${nightRanges(near)} — 1시간째 ${ch} 달력에 없어 다른 채널에서 열었어요. 취소가 맞는지 확인하세요`, room: a.room });
+  }
+
+  for (const m of msgs) await sendPushToAll(env, m);
+  const next = JSON.stringify(st);
+  if (next !== (raw || '{}')) await env.HANA_KV.put('alarm_state', next);
+  return msgs;
+}
+
+// ③ 동기화 연속 실패 — 3번째(15분)·이후 3시간마다, 복구되면 한 번
+async function noteSyncResult(env, ok, err) {
+  const raw = await env.PUSH_KV.get('sync_fail');
+  if (ok) {
+    if (raw !== null) {
+      await env.PUSH_KV.delete('sync_fail');
+      if (+raw >= 3) await sendPushToAll(env, { title: '✅ 동기화 다시 됨', body: '예약 동기화가 복구됐어요. 멈춘 동안 들어온 예약을 확인하세요' });
+    }
+    return;
+  }
+  const n = (+raw || 0) + 1;
+  await env.PUSH_KV.put('sync_fail', String(n));
+  if (n === 3 || (n > 3 && (n - 3) % 36 === 0)) {
+    await sendPushToAll(env, { title: '🚨 예약 동기화가 멈췄어요', body: `${n * 5}분째 실패 중 — 새 예약이 다른 채널로 안 넘어가요. 확정할 때 채널마다 직접 닫으세요 (${String(err || '').slice(0, 60)})` });
+  }
+}
+
+// ④ 모르는 방 이름으로 달력을 가져감 — 이름별 하루 한 번, 하루 최대 5개
+async function noteUnknownIcal(env, roomName, target) {
+  const today = todayKST(), day = ymdStr(today.y, today.m, today.d);
+  const raw = await env.HANA_KV.get('ical_unknown');
+  let st; try { st = JSON.parse(raw || '{}') || {}; } catch (e) { st = {}; }
+  if (st.day !== day) st = { day, names: {} };
+  const key = `${roomName}${target ? '/' + target : ''}`.slice(0, 60);
+  if (st.names[key] || Object.keys(st.names).length >= 5) return;
+  st.names[key] = 1;
+  await env.HANA_KV.put('ical_unknown', JSON.stringify(st));
+  await sendPushToAll(env, { title: '⚠️ 빈 달력을 가져간 곳이 있어요', body: `'${key}' 라는 방 이름으로 달력을 가져갔는데 그런 방이 없어요. 호실 이름을 바꿨다면 채널에 등록된 달력 주소도 바꿔야 해요` });
 }
 
 // ── 피드 변화 기록 (feed_changes) — 2026-09-22 ────────────────────────────
@@ -644,7 +768,10 @@ async function fetchAndParseIcal(url, platform) {
   try {
     const resp = await fetch(url.replace(/^webcal:\/\//i, 'https://'), { headers: { 'User-Agent': 'Mozilla/5.0' } });
     if (!resp.ok) return null;
-    return parseIcal(await resp.text(), platform);
+    const text = await resp.text();
+    // 달력이 아닌 응답(점검·로그인 화면 등)은 '예약 0개'가 아니라 연결 오류다 → 이전 값 유지 (#40)
+    if (!/BEGIN:VCALENDAR/i.test(text)) return null;
+    return parseIcal(text, platform);
   } catch { return null; }
 }
 
@@ -1395,6 +1522,7 @@ async function exportIcal(env, roomName, target = null) {
   const horizon = dayMs(t.y, t.m + OPEN_MONTHS_BK_TR, t.d + GRACE_DAYS);  // Date.UTC가 월/일 넘침을 보정
   const data = await env.HANA_KV.get('synced_bookings');
   let roomBookings = data ? JSON.parse(data)[roomName] : null;
+  if (!roomBookings) { try { await noteUnknownIcal(env, roomName, target); } catch (e) {} }   // 응답은 그대로 (알림만)
 
   // 트립 당일잠금 가짜 하룻밤 — 에어비앤비 전용 주소에서만 걷어낸다 (05-known-issues #28).
   // 왜 ab 하나만인가: 그 밤을 팔 수 있는 채널이 하나뿐이어야 두 채널이 같은 밤을 동시에 파는
