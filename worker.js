@@ -530,15 +530,17 @@ async function syncAllRooms(env, withPush = false) {
 //     → 그 5분 동안 /ical 내보내기에서 트립 막힘이 빠짐 → 에어비앤비가 그때 가져가면 날짜가 열림.
 //     2026-11-13 601호: 트립 11/12~11/18 위에 에어비앤비 11/14~11/20 이 21:10 에 들어와 오버부킹.
 //     10/24~11/13 601호만 열린 틈 165번·857분 (#40).
-// 규칙: **막힘은 바로, 풀림은 2시간 지켜본 뒤.**
+// 규칙: **막힘은 바로, 풀림은 1시간 지켜본 뒤.**
 //   - 앞으로의 밤(오늘 밤 포함)이 직전보다 하나라도 풀리면 → 직전 목록을 그대로 유지 (+ 새로 생긴 막힘은 바로 얹음)
-//   - 그 상태가 2시간 내내 이어졌을 때만 새 피드를 믿는다. 중간에 한 번이라도 돌아오면 타이머 초기화
+//   - 그 상태가 1시간 내내 이어졌을 때만 새 피드를 믿는다. 중간에 한 번이라도 돌아오면 타이머 초기화
 //   - 지난 밤만 빠지는 건(자정 앞잘림·07시 당일잠금 해제) 풀림이 아니다 → 그대로 통과
-// 대가: 진짜 취소도 다른 채널에서 최대 2시간 늦게 열린다 — 오버부킹 나는 쪽으로는 틀리지 않는다
+// 대가: 진짜 취소도 다른 채널에서 최대 1시간 늦게 열린다 — 오버부킹 나는 쪽으로는 틀리지 않는다
 // ⛔ 아카이브·알림 기억표·원본 진단(fix 없는 /?url=)에는 받은 그대로 쓴다. 버팀본은 synced_bookings 에만
-// 적용 채널: 트립만 (사장님 2026-11-13 — 트립은 402·601·603 만 운영). 넓히려면 별도 승인
-const HOLD_PLATFORMS = ['tr'];
-const HOLD_MS = 2 * 3600 * 1000;
+// 적용 채널: 트립·부킹·리브 (사장님 2026-11-13 — 에어비앤비끼리는 문제 없고, 다른 채널과 엇갈릴 때 생기는 문제).
+//   에어비앤비는 넣지 않는다. 시간·채널을 바꾸려면 사장님 승인
+//   부킹은 매일 판매 기간 맨 앞 하룻밤(1년 뒤)이 열린다 → 그 밤만 1시간 늦게 열림. 무해
+const HOLD_PLATFORMS = ['tr', 'bk', 'lv'];
+const HOLD_MS = 1 * 3600 * 1000;
 
 function holdFeed(prevOut, fresh, since, now, today) {
   const dn = (y, m, d) => Math.round(Date.UTC(y, m, d) / 86400000);
@@ -552,7 +554,7 @@ function holdFeed(prevOut, fresh, since, now, today) {
   const opened = prevOut.some(b => nightsOf(b).some(n => n >= todayN && !freshNights.has(n)));
   if (!opened) return { out: fresh, since: null };
   const start = (typeof since === 'number' && since <= now) ? since : now;
-  if (now - start >= HOLD_MS) return { out: fresh, since: null };   // 2시간 내내 풀려 있었다 → 믿는다
+  if (now - start >= HOLD_MS) return { out: fresh, since: null };   // 1시간 내내 풀려 있었다 → 믿는다
   const prevNights = new Set(prevOut.flatMap(nightsOf));
   const added = fresh.filter(b => nightsOf(b).some(n => !prevNights.has(n)));
   return { out: [...prevOut, ...added], since: start };
