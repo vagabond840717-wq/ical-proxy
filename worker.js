@@ -457,8 +457,9 @@ async function syncAllRooms(env, withPush = false) {
         for (const uid of newOnes) {
           const b = bookingMap[uid];
           if (new Date(b.cinY, b.cinM, b.cinD) > sixMonthsLater) continue;
-          const msg = { title: `📅 ${room.name} 새 예약`, body: `${p.label} ${b.cin}~${b.cout}`, room: room.name };
-          await sendPushToAll(env, msg);
+          // ⛔ 새 예약은 폰 푸시로 보내지 않는다 — 알림 목록(🔔)에만 남긴다 (사장님 2026-11-14).
+          //    부킹·트립은 투숙 중 매일 새벽 지난 밤을 잘라 보내서, 날짜 완전일치 비교로는 잘린 모양이 '새 예약'으로 보인다.
+          //    푸시는 이상 알림(끊김·막힘 빠짐·오버부킹·동기화 멈춤)만.
           await saveEvent(env, { type: 'new', room: room.name, platform: p.label, cin: b.cin, cout: b.cout, ts: Date.now() });
         }
       }
