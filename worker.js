@@ -76,6 +76,11 @@ export default {
       }
     }
     // 트립 당일잠금 판정 상태 — 진단용 읽기 전용
+    if (path === '/hold' && request.method === 'GET') {
+      // 피드 끊김 버팀 상태 (진단용) — 호실|채널: 처음 풀린 시각. 비어 있으면 버티는 중인 곳 없음
+      const raw = await env.HANA_KV.get('feed_hold') || '{}';
+      return new Response(raw, { headers: { 'Content-Type': 'application/json', ...cors(request) } });
+    }
     if (path === '/daylock' && request.method === 'GET') {
       return json(await readDaylock(env), request);
     }
@@ -314,6 +319,13 @@ async function syncAllRooms(env, withPush = false) {
   // 복구 감지용: 루프 시작 전 현재 미확인 오류 이벤트 목록을 1회 로드
   const cachedEvents = withPush ? JSON.parse(await env.PUSH_KV.get('events') || '[]') : [];
   const recoveryActions = []; // { room, platform } — 루프 후 일괄 처리
+  // 피드 끊김 버팀 (feed-hold) — 직전 판정 상태. 호실|채널 → 처음 사라진 시각(ms)
+  const holdPrevRaw = await env.HANA_KV.get('feed_hold') || '{}';
+  let holdPrev; try { holdPrev = JSON.parse(holdPrevRaw) || {}; } catch (e) { holdPrev = {}; }
+  const holdNext = {};
+  const holdNow = Date.now();
+  const holdToday = todayKST();
+  const failedFeeds = new Set();
   // 병렬 처리 결과를 호실 배열 순서대로 모아두고, 루프가 끝난 뒤 고정된 순서로 합친다
   // (Promise.all 완료 순서는 매번 달라서, 그 순서로 바로 객체에 써넣으면 키 순서가 흔들려
   //  내용이 같아도 JSON 문자열이 달라져 불필요한 KV 쓰기가 발생함)
@@ -337,6 +349,7 @@ async function syncAllRooms(env, withPush = false) {
       if (!p.url) continue;
       const result = await fetchAndParseIcal(p.url, p.type);
       if (result === null) {
+        failedFeeds.add(`${room.name}|${p.key}`);
         if (withPush) {
           // 오류 시 curr에 저장하지 않음 — prev 값은 저장 시 merge로 유지
           const failKey = `fail_${room.name}_${p.key}`;
@@ -358,7 +371,15 @@ async function syncAllRooms(env, withPush = false) {
         // 목록 전체를 훑어보는(list) 대신, 그 키 하나만 콕 찍어 확인(get) → 나열 한도 대신 여유로운 읽기 한도 사용
         if (await env.PUSH_KV.get(failKey) !== null) await env.PUSH_KV.delete(failKey);
       }
-      bookings[p.key] = result;
+      // ⚠ 아카이브·알림에는 받은 그대로(result), 내보내기·화면 재료(synced_bookings)에는 버팀본을 넣는다
+      if (HOLD_PLATFORMS.includes(p.key)) {
+        const hk = `${room.name}|${p.key}`;
+        const h = holdFeed(prevRoomData[p.key] || [], result, holdPrev[hk], holdNow, holdToday);
+        if (h.since != null) holdNext[hk] = h.since;
+        bookings[p.key] = h.out;
+      } else {
+        bookings[p.key] = result;
+      }
       newArchive[room.name][p.key] = result;
       if (withPush) {
         const bookingMap = {};
@@ -401,6 +422,16 @@ async function syncAllRooms(env, withPush = false) {
       }
     }
   }
+  // 피드 끊김 버팀 상태 저장 — 바뀔 때만 write (KV 한도 원칙).
+  // 수신 실패(null)한 채널은 위에서 건너뛰므로 판정 시각을 그대로 물려준다 (실패 중에 타이머가 리셋되지 않게)
+  for (const [hk, since] of Object.entries(holdPrev)) {
+    if (!(hk in holdNext) && failedFeeds.has(hk)) holdNext[hk] = since;
+  }
+  try {
+    const holdNextRaw = JSON.stringify(holdNext);
+    if (holdNextRaw !== JSON.stringify(holdPrev)) await env.HANA_KV.put('feed_hold', holdNextRaw);
+  } catch (e) {}
+
   // 트립 당일잠금 판정 — 갓 받은 피드로 판단해야 하므로 여기서 한 번만 돌린다.
   // 실패해도 sync 결과는 지켜야 하므로 삼킨다 (교정 안 함 = 지금까지와 동일 동작).
   let daylock = {};
@@ -491,6 +522,40 @@ async function syncAllRooms(env, withPush = false) {
   }
 
   return { synced: rooms.length, time: new Date().toISOString() };
+}
+
+// ── 피드 끊김 버팀 (feed-hold) — 2026-11-13 ───────────────────────────────
+// 왜: 트립닷컴 피드는 하루 5~14번, 5분씩 **정상 응답인데 예약 0개**인 빈 달력을 보낸다.
+//     연결 오류(null)는 위에서 이전 값을 지키지만, 빈 달력은 '전부 취소'로 믿고 그대로 대입했다
+//     → 그 5분 동안 /ical 내보내기에서 트립 막힘이 빠짐 → 에어비앤비가 그때 가져가면 날짜가 열림.
+//     2026-11-13 601호: 트립 11/12~11/18 위에 에어비앤비 11/14~11/20 이 21:10 에 들어와 오버부킹.
+//     10/24~11/13 601호만 열린 틈 165번·857분 (#40).
+// 규칙: **막힘은 바로, 풀림은 2시간 지켜본 뒤.**
+//   - 앞으로의 밤(오늘 밤 포함)이 직전보다 하나라도 풀리면 → 직전 목록을 그대로 유지 (+ 새로 생긴 막힘은 바로 얹음)
+//   - 그 상태가 2시간 내내 이어졌을 때만 새 피드를 믿는다. 중간에 한 번이라도 돌아오면 타이머 초기화
+//   - 지난 밤만 빠지는 건(자정 앞잘림·07시 당일잠금 해제) 풀림이 아니다 → 그대로 통과
+// 대가: 진짜 취소도 다른 채널에서 최대 2시간 늦게 열린다 — 오버부킹 나는 쪽으로는 틀리지 않는다
+// ⛔ 아카이브·알림 기억표·원본 진단(fix 없는 /?url=)에는 받은 그대로 쓴다. 버팀본은 synced_bookings 에만
+// 적용 채널: 트립만 (사장님 2026-11-13 — 트립은 402·601·603 만 운영). 넓히려면 별도 승인
+const HOLD_PLATFORMS = ['tr'];
+const HOLD_MS = 2 * 3600 * 1000;
+
+function holdFeed(prevOut, fresh, since, now, today) {
+  const dn = (y, m, d) => Math.round(Date.UTC(y, m, d) / 86400000);
+  const todayN = dn(today.y, today.m, today.d);
+  const nightsOf = b => {
+    const out = [], s = dn(b.cinY, b.cinM, b.cinD), e = dn(b.coutY, b.coutM, b.coutD);
+    for (let n = s; n < e && out.length < 800; n++) out.push(n);
+    return out;
+  };
+  const freshNights = new Set(fresh.flatMap(nightsOf));
+  const opened = prevOut.some(b => nightsOf(b).some(n => n >= todayN && !freshNights.has(n)));
+  if (!opened) return { out: fresh, since: null };
+  const start = (typeof since === 'number' && since <= now) ? since : now;
+  if (now - start >= HOLD_MS) return { out: fresh, since: null };   // 2시간 내내 풀려 있었다 → 믿는다
+  const prevNights = new Set(prevOut.flatMap(nightsOf));
+  const added = fresh.filter(b => nightsOf(b).some(n => !prevNights.has(n)));
+  return { out: [...prevOut, ...added], since: start };
 }
 
 // ── 피드 변화 기록 (feed_changes) — 2026-09-22 ────────────────────────────
