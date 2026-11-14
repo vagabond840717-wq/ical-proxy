@@ -90,6 +90,10 @@ export default {
       const after = JSON.parse(await env.HANA_KV.get('feed_hold') || '{}');
       return json({ ok: true, released: !after[b.key] || !(after[b.key].q || []).length }, request);
     }
+    if (path === '/hold/log' && request.method === 'GET') {
+      // 끊김 기록 (7일 한정, 진단용) — 최신이 앞
+      return new Response(await env.HANA_KV.get('hold_log') || '[]', { headers: { 'Content-Type': 'application/json', ...cors(request) } });
+    }
     if (path === '/hold' && request.method === 'GET') {
       // 피드 끊김 버팀 상태 (진단용) — 호실|채널: 처음 풀린 시각. 비어 있으면 버티는 중인 곳 없음
       const raw = await env.HANA_KV.get('feed_hold') || '{}';
@@ -372,6 +376,7 @@ async function syncAllRooms(env, withPush = false) {
   const holdNext = {};
   let holdOk = {}; try { holdOk = JSON.parse(await env.HANA_KV.get('hold_ok') || '{}') || {}; } catch (e) { holdOk = {}; }
   const holdOkUsed = new Set();
+  const holdInfo = {};   // 끊김 기록용 (hold-log) — 이번 차례 판정 요약
   const holdNow = Date.now();
   const holdToday = todayKST();
   const failedFeeds = new Set();
@@ -426,6 +431,7 @@ async function syncAllRooms(env, withPush = false) {
         const hk = `${room.name}|${p.key}`;
         const h = holdFeed(prevRoomData[p.key] || [], result, holdPrev[hk], holdNow, holdToday, holdOk[hk]);
         if (h.st) holdNext[hk] = h.st;
+        holdInfo[hk] = { whole: !!h.whole, confirmed: !!(h.confirmed && h.confirmed.length), n: h.st && h.st.m ? Object.keys(h.st.m).length : 0 };
         if (h.confirmed) holdOkUsed.add(hk);
         if (h.ask) alarmQueue.push({ kind: 'ask', room: room.name, ch: p.key, nights: h.waitNights, whole: h.whole });
         if (h.recovered && h.recovered.length) alarmQueue.push({ kind: 'back', room: room.name, ch: p.key, nights: h.recovered, still: (h.waitNights || []).filter(n => !h.recovered.includes(n)) });
@@ -483,7 +489,10 @@ async function syncAllRooms(env, withPush = false) {
   }
   try {
     const holdNextRaw = JSON.stringify(holdNext);
-    if (holdNextRaw !== JSON.stringify(holdPrev)) await env.HANA_KV.put('feed_hold', holdNextRaw);
+    if (holdNextRaw !== JSON.stringify(holdPrev)) {
+      await env.HANA_KV.put('feed_hold', holdNextRaw);
+      try { await appendHoldLog(env, holdPrev, holdNext, holdInfo, failedFeeds, holdNow); } catch (e) {}
+    }
     // 쓴 확인·더는 기다리지 않는 곳의 확인은 지운다 (남겨두면 다음 일에 잘못 쓰일 수 있다)
     const okKeys = Object.keys(holdOk);
     const okNext = Object.fromEntries(okKeys.filter(k => !holdOkUsed.has(k) && holdNext[k]).map(k => [k, holdOk[k]]));
@@ -644,6 +653,33 @@ function holdFeed(prevOut, fresh, st, now, today, ok) {
     ask: fresh_q.length > 0, askNights: fresh_q, waitNights: waiting, recovered,
     whole: !fresh.some(b => nightsOf(b).some(n => n >= todayN)),
   };
+}
+
+// ── 끊김 기록 (hold-log) — 2026-11-14 ~ 11-21, 7일 한정 ─────────────────────
+// 왜: 버팀(feed-hold) 뒤로는 끊김이 변화기록에 안 남아 "밤사이 끊겼나"에 답할 수 없다 (사장님 11/14).
+//     사장님 요청으로 7일만 적고 Claude 가 매일 확인·보고한다. 날짜를 막고 여는 동작은 건드리지 않는다
+// 줄: {ts, room, ch, kind:'drop'|'back'|'ask'|'release', n:밤 수, whole, min:끊긴 분}
+//   drop 끊김 시작 · back 끝남(min=걸린 시간. 60분 넘고 ask 없으면 먼 밤 자동 정리) · ask 1시간 넘김(🔒) · release 사장님이 풂
+// ⛔ HOLD_LOG_UNTIL 이 지나면 아무것도 안 쓴다. 상한 2,000줄. 조회 GET /hold/log
+const HOLD_LOG_UNTIL = Date.UTC(2026, 10, 21, 15, 0);   // 2026-11-22 00:00 KST
+async function appendHoldLog(env, prev, next, info, failed, now) {
+  if (now >= HOLD_LOG_UNTIL) return;
+  const rows = [];
+  const first = st => { const v = Object.values((st && st.m) || {}); return v.length ? Math.min(...v) : (typeof st === 'number' ? st : (st && st.s) || null); };
+  const [room, ch] = [k => k.slice(0, k.lastIndexOf('|')), k => k.slice(k.lastIndexOf('|') + 1)];
+  for (const k of new Set([...Object.keys(prev || {}), ...Object.keys(next || {})])) {
+    const a = prev[k], b = next[k], i = info[k] || {};
+    if (!a && b) rows.push({ ts: now, room: room(k), ch: ch(k), kind: 'drop', n: i.n, whole: i.whole });
+    else if (a && !b && !failed.has(k)) {
+      const s = first(a);
+      rows.push({ ts: now, room: room(k), ch: ch(k), kind: i.confirmed ? 'release' : 'back',
+                  min: s ? Math.round((now - s) / 60000) : null });
+    } else if (a && b && (b.q || []).length > (a.q || []).length) rows.push({ ts: now, room: room(k), ch: ch(k), kind: 'ask', n: b.q.length, whole: i.whole });
+  }
+  if (!rows.length) return;
+  let log = []; try { log = JSON.parse(await env.HANA_KV.get('hold_log') || '[]'); } catch (e) { log = []; }
+  if (!Array.isArray(log)) log = [];
+  await env.HANA_KV.put('hold_log', JSON.stringify([...rows, ...log].slice(0, 2000)));
 }
 
 // ── 이상 알림 (alarms) — 2026-11-13 ──────────────────────────────────────
